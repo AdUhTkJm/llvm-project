@@ -346,8 +346,6 @@ public:
 
   // Converts the matrix to an IntMatrix as-is. If any value in the matrix
   // is not an integer, the function triggers an assertion failure.
-  // Though equivalent to normalizeRows() when all entries are integers,
-  // the semantics are clearer.
   IntMatrix asIntMatrix() const;
 };
 
