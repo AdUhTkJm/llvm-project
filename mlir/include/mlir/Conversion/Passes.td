@@ -1226,6 +1226,22 @@ def SCFToControlFlowPass : Pass<"convert-scf-to-cf"> {
 }
 
 //===----------------------------------------------------------------------===//
+// SCFToAffine
+//===----------------------------------------------------------------------===//
+
+def SCFToAffinePass : Pass<"convert-scf-to-affine"> {
+  let summary = "Convert SCF dialect to affine dialect, replacing for operations"
+                " with affine loops wherever possible";
+  let description = [{
+    Converts SCF for-operations into affine loops. Since affine loops expect
+    variables of type `index`, which are not intended to overflow, guard
+    conditions and a fallback path will be generated for the conversion when
+    the for-operation uses a fixed-width integer type.
+  }];
+  let dependentDialects = ["affine::AffineDialect"];
+}
+
+//===----------------------------------------------------------------------===//
 // SCFToOpenMP
 //===----------------------------------------------------------------------===//
 
