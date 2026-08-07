@@ -449,6 +449,18 @@ def ConvertControlFlowToSPIRVPass : Pass<"convert-cf-to-spirv"> {
 }
 
 //===----------------------------------------------------------------------===//
+// LLVMToControlFlow
+//===----------------------------------------------------------------------===//
+
+def ConvertLLVMToControlFlowPass : Pass<"convert-llvm-to-cf", "ModuleOp"> {
+  let summary = "Convert LLVM dialect branches to Control Flow operations";
+  let description = [{
+    Convert LLVM dialect branch operations to Control Flow dialect.
+  }];
+  let dependentDialects = ["LLVM::LLVMDialect", "cf::ControlFlowDialect"];
+}
+
+//===----------------------------------------------------------------------===//
 // FuncToEmitC
 //===----------------------------------------------------------------------===//
 
