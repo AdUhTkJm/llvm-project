@@ -136,6 +136,15 @@ def ConvertAMDGPUToROCDLPass : Pass<"convert-amdgpu-to-rocdl"> {
 }
 
 //===----------------------------------------------------------------------===//
+// ArithToEmitC
+//===----------------------------------------------------------------------===//
+
+def ConvertArithToAffine : Pass<"convert-arith-to-affine"> {
+  let summary = "Convert Arith dialect to affine dialect";
+  let dependentDialects = ["affine::AffineDialect"];
+}
+
+//===----------------------------------------------------------------------===//
 // ArithToAMDGPU
 //===----------------------------------------------------------------------===//
 def ArithToAMDGPUConversionPass : Pass<"convert-arith-to-amdgpu"> {
