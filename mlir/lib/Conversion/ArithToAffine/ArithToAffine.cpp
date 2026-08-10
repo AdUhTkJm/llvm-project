@@ -1,8 +1,10 @@
 #include "mlir/Conversion/ArithToAffine/ArithToAffine.h"
 
 #include "mlir/Analysis/Presburger/IntegerRelation.h"
+#include "mlir/Analysis/Presburger/PresburgerSpace.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemoryAccessOpInterfaces.h"
+#include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -34,9 +36,6 @@ struct ArithToAffinePass : impl::ConvertArithToAffineBase<ArithToAffinePass> {
     // The constraints on the symbols such that intermediate results will
     // not overflow.
     IntegerRelation constraint;
-    // Indices of unused operands. For example, this could include the const
-    // values that are folded already.
-    DenseSet<int> unused;
   };
 
   // Maps each affine value to its dimension index in a presburger relation.
@@ -44,6 +43,7 @@ struct ArithToAffinePass : impl::ConvertArithToAffineBase<ArithToAffinePass> {
 
   std::optional<LiftResult> valueToAffine(Value value);
   std::optional<AffineResult> constructAffineMap(Value value, const DimIndex &dimIndex);
+  LiftResult tidyResult(const AffineResult &result, ValueRange operands);
   Value lift(Value value);
   void runOnOperation() override;
 };
@@ -126,16 +126,6 @@ std::optional<IntVector> extractCoefficients(AffineExpr expr, int numSymbols) {
   return std::nullopt;
 }
 
-template<class T>
-DenseSet<T> intersect(const DenseSet<T> &a, const DenseSet<T> &b) {
-  DenseSet<T> result;
-  for (auto x : a) {
-    if (b.contains(x))
-      result.insert(x);
-  }
-  return result;
-}
-
 // Computes x^y for DynamicAPInt.
 DynamicAPInt pow(DynamicAPInt x, unsigned y) {
   DynamicAPInt result(1);
@@ -172,15 +162,14 @@ std::optional<ArithToAffinePass::AffineResult> ArithToAffinePass::constructAffin
       return std::nullopt;
 
     AffineExpr expr = getAffineConstantExpr(stepValue.getSExtValue(), ctx);
-    DenseSet<int> unused { dimIndex.at(value) };
-    return AffineResult { expr, universe, unused };
+    return AffineResult { expr, universe };
   }
 
   // We will not trace upwards from block arguments in `valueToAffine()`.
   Operation *def = value.getDefiningOp();
   if (!def) {
     AffineExpr expr = getAffineSymbolExpr(dimIndex.at(value), ctx);
-    return AffineResult { expr, universe, DenseSet<int>() };
+    return AffineResult { expr, universe };
   }
 
   // So when we reach here, the value must be an operation result.
@@ -197,7 +186,7 @@ std::optional<ArithToAffinePass::AffineResult> ArithToAffinePass::constructAffin
       .Case<arith::AddIOp>([&](arith::AddIOp) { return l->expr + r->expr; })
       .Case<arith::SubIOp>([&](arith::SubIOp) { return l->expr - r->expr; })
       .Case<arith::MulIOp>([&](arith::MulIOp) { return l->expr * r->expr; })
-      .DefaultUnreachable("constructAffineMap: only accepts addi and muli!");
+      .DefaultUnreachable("constructAffineMap: only accepts limited arith!");
 
     auto constraint = l->constraint.intersect(r->constraint);
     auto maybeSum = extractCoefficients(expr, numSymbols);
@@ -208,7 +197,6 @@ std::optional<ArithToAffinePass::AffineResult> ArithToAffinePass::constructAffin
     // We must guarantee that the result does not overflow.
     // That is, min <= result <= max.
     auto [min, max] = getBounds(def->getResult(0).getType());
-    llvm::interleaveComma(result, llvm::errs()); llvm::errs() << "\n";
     // IntegerRelations expect constraints of form `row >= 0`.
     // First add a row for `result - min >= 0`.
     result.back() -= min;
@@ -221,13 +209,87 @@ std::optional<ArithToAffinePass::AffineResult> ArithToAffinePass::constructAffin
     result.back() += max;
     constraint.addInequality(result);
     constraint.simplify();
-    return AffineResult { expr, constraint, intersect(l->unused, r->unused) };
+    return AffineResult { expr, constraint };
   }
   return std::nullopt;
 }
 
+ArithToAffinePass::LiftResult ArithToAffinePass::tidyResult(const AffineResult &result, ValueRange operands) {
+  // No need to tidy expressions without operands.
+  if (operands.empty())
+    return { operands, result.expr, result.constraint };
+
+  // Compute unused indices.
+  unsigned numOperands = operands.size();
+  MLIRContext *ctx = operands[0].getContext();
+  DenseSet<unsigned> used;
+  result.expr.walk([&](AffineExpr expr) {
+    if (auto symbol = dyn_cast<AffineSymbolExpr>(expr))
+      used.insert(symbol.getPosition());
+  });
+
+  // Maps old indices to ones after removal of unused indices, and
+  // reconstruct an expression.
+  SmallVector<AffineExpr> replacement(numOperands);
+  DenseMap<unsigned, unsigned> indexMap;
+  for (unsigned i = 0, index = 0; i < numOperands; i++) {
+    if (used.contains(i)) {
+      replacement[i] = getAffineSymbolExpr(index, ctx);
+      indexMap[i] = index;
+      index++;
+    } else
+      replacement[i] = getAffineConstantExpr(0, ctx);
+  }
+  auto expr = result.expr.replaceSymbols(replacement);
+
+  // Remove columns of constraints.
+  unsigned numLeft = used.size();
+  IntegerRelation constraint(PresburgerSpace::getSetSpace(numLeft));
+  const auto removeColumn = [&](bool isEq) {
+    SmallVector<DynamicAPInt> x(numLeft + 1);
+    unsigned size = isEq
+      ? result.constraint.getNumEqualities()
+      : result.constraint.getNumInequalities();
+    for (unsigned i = 0; i < size; i++) {
+      auto row = isEq
+        ? result.constraint.getEquality(i)
+        : result.constraint.getInequality(i);
+      for (auto [before, after] : indexMap)
+        x[after] = row[before];
+      x.back() = row.back();
+      if (isEq)
+        constraint.addEquality(x);
+      else
+        constraint.addInequality(x);
+    }
+  };
+  removeColumn(true);
+  removeColumn(false);
+
+  OpBuilder builder(ctx);
+  auto loc = operands[0].getLoc();
+  SmallVector<Value> symbols;
+  // For every related operand, cast them to index if they aren't already.
+  // TODO: deduplicate these casts.
+  for (auto [i, v] : llvm::enumerate(operands)) {
+    if (!used.contains(i))
+      continue;
+
+    if (!isa<IndexType>(v.getType())) {
+      builder.setInsertionPointAfterValue(v);
+      auto cast = arith::IndexCastOp::create(builder, loc, builder.getIndexType(), v);
+      symbols.push_back(cast.getResult());
+    } else {
+      symbols.push_back(v);
+    }
+  }
+
+  return LiftResult {
+    symbols, expr, constraint
+  };
+}
+
 std::optional<ArithToAffinePass::LiftResult> ArithToAffinePass::valueToAffine(Value value) {
-  OpBuilder builder(value.getContext());
   // We trace back the arithmetic computations of the given value till a valid symbol.
   // If eventually we failed to hit anything convertible to symbol, we abort.
   SmallVector<Value> operands;
@@ -244,30 +306,11 @@ std::optional<ArithToAffinePass::LiftResult> ArithToAffinePass::valueToAffine(Va
   PresburgerSpace space = PresburgerSpace::getSetSpace(numInputs);
   IntegerRelation relation(space);
   
-  auto result = constructAffineMap(value, dimIndex);
-  if (!result)
+  auto maybeResult = constructAffineMap(value, dimIndex);
+  if (!maybeResult)
     return std::nullopt;
   
-  auto loc = value.getLoc();
-  SmallVector<Value> symbols;
-  // For every related operand, cast them to index if they aren't already.
-  // TODO: deduplicate these casts.
-  for (auto [i, v] : llvm::enumerate(operands)) {
-    if (result->unused.contains(i))
-      continue;
-
-    if (!isa<IndexType>(v.getType())) {
-      builder.setInsertionPointAfterValue(v);
-      auto cast = arith::IndexCastOp::create(builder, loc, builder.getIndexType(), v);
-      symbols.push_back(cast.getResult());
-    } else {
-      symbols.push_back(v);
-    }
-  }
-
-  return LiftResult {
-    symbols, result->expr, result->constraint
-  };
+  return tidyResult(*maybeResult, operands);
 }
 
 Value ArithToAffinePass::lift(Value value) {
