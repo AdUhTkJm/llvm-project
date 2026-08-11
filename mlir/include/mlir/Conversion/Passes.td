@@ -141,7 +141,7 @@ def ConvertAMDGPUToROCDLPass : Pass<"convert-amdgpu-to-rocdl"> {
 
 def ConvertArithToAffine : Pass<"convert-arith-to-affine"> {
   let summary = "Convert Arith dialect to affine dialect";
-  let dependentDialects = ["affine::AffineDialect"];
+  let dependentDialects = ["affine::AffineDialect", "LLVM::LLVMDialect"];
 }
 
 //===----------------------------------------------------------------------===//
@@ -1011,6 +1011,15 @@ def ConvertMemRefToEmitC : Pass<"convert-memref-to-emitc", "ModuleOp"> {
       "lowerToCpp", "lower-to-cpp", "bool",
       /*default=*/"false",
       /*description=*/"Target C++ (true) instead of C (false)">];
+}
+
+//===----------------------------------------------------------------------===//
+// MemRefToArith
+//===----------------------------------------------------------------------===//
+
+def ConvertMemRefToArith : Pass<"convert-memref-to-arith", "ModuleOp"> {
+  let summary = "Convert MemRef dialect to Arith dialect";
+  let dependentDialects = ["arith::ArithDialect"];
 }
 
 //===----------------------------------------------------------------------===//

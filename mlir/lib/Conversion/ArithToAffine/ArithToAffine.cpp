@@ -2,14 +2,18 @@
 
 #include "mlir/Analysis/Presburger/IntegerRelation.h"
 #include "mlir/Analysis/Presburger/PresburgerSpace.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/MemRef/IR/MemoryAccessOpInterfaces.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "llvm/ADT/DynamicAPInt.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/TypeSwitch.h"
 
 namespace mlir {
 #define GEN_PASS_DEF_CONVERTARITHTOAFFINE
@@ -57,7 +61,7 @@ void collectOperandsUpChain(Value value, SmallVector<Value> &operands) {
     return;
   }
 
-  if (isa<arith::ArithDialect>(def->getDialect())) {
+  if (isa<arith::ArithDialect>(def->getDialect()) || isa<LLVM::GEPOp>(def)) {
     for (auto operand : def->getOperands())
       collectOperandsUpChain(operand, operands);
   } else {
@@ -139,6 +143,7 @@ DynamicAPInt pow(DynamicAPInt x, unsigned y) {
 }
 
 std::pair<DynamicAPInt, DynamicAPInt> getBounds(Type type) {
+  type.dump();
   assert(type.isInteger());
   unsigned width = type.getIntOrFloatBitWidth();
   if (type.isSignedInteger()) {
@@ -148,6 +153,30 @@ std::pair<DynamicAPInt, DynamicAPInt> getBounds(Type type) {
 
   auto power = pow(DynamicAPInt(2), width);
   return { DynamicAPInt(0), power-1 };
+}
+
+LogicalResult populateConstraint(AffineExpr expr, unsigned numSymbols, Type type, IntegerRelation &constraint) {
+  auto maybeSum = extractCoefficients(expr, numSymbols);
+  if (!maybeSum)
+    return failure();
+
+  IntVector result = *maybeSum;
+  // We must guarantee that the result does not overflow.
+  // That is, min <= result <= max.
+  auto [min, max] = getBounds(type);
+  // IntegerRelations expect constraints of form `row >= 0`.
+  // First add a row for `result - min >= 0`.
+  result.back() -= min;
+  constraint.addInequality(result);
+  // Then add a row for `result - sum >= 0`.
+  // Recover the last element for `sum` and flip all signs.
+  result.back() += min;
+  for (auto &e : result)
+    e *= -1;
+  result.back() += max;
+  constraint.addInequality(result);
+  constraint.simplify();
+  return success();
 }
 
 std::optional<ArithToAffinePass::AffineResult> ArithToAffinePass::constructAffineMap(Value value, const DimIndex &dimIndex) {
@@ -186,29 +215,47 @@ std::optional<ArithToAffinePass::AffineResult> ArithToAffinePass::constructAffin
       .Case<arith::AddIOp>([&](arith::AddIOp) { return l->expr + r->expr; })
       .Case<arith::SubIOp>([&](arith::SubIOp) { return l->expr - r->expr; })
       .Case<arith::MulIOp>([&](arith::MulIOp) { return l->expr * r->expr; })
-      .DefaultUnreachable("constructAffineMap: only accepts limited arith!");
+      .DefaultUnreachable("constructAffineMap: should be exhaustive!");
 
     auto constraint = l->constraint.intersect(r->constraint);
-    auto maybeSum = extractCoefficients(expr, numSymbols);
-    if (!maybeSum)
+    if (failed(populateConstraint(expr, numSymbols, def->getResult(0).getType(), constraint)))
       return std::nullopt;
 
-    IntVector result = *maybeSum;
-    // We must guarantee that the result does not overflow.
-    // That is, min <= result <= max.
-    auto [min, max] = getBounds(def->getResult(0).getType());
-    // IntegerRelations expect constraints of form `row >= 0`.
-    // First add a row for `result - min >= 0`.
-    result.back() -= min;
-    constraint.addInequality(result);
-    // Then add a row for `result - sum >= 0`.
-    // Recover the last element for `sum` and flip all signs.
-    result.back() += min;
-    for (auto &e : result)
-      e *= -1;
-    result.back() += max;
-    constraint.addInequality(result);
-    constraint.simplify();
+    return AffineResult { expr, constraint };
+  }
+  if (isa<arith::ExtSIOp, arith::ExtUIOp>(def)) {
+    // This never imposes any extra constraint.
+    return constructAffineMap(def->getOperand(0), dimIndex);
+  }
+
+  if (auto gep = dyn_cast<LLVM::GEPOp>(def)) {
+    auto indices = gep.getIndices();
+    Type elementType = gep.getElemType();
+    AffineExpr expr = getAffineConstantExpr(0, ctx);
+    IntegerRelation constraint(PresburgerSpace::getSetSpace(numSymbols));
+    // We constraint on the sum only.
+    DataLayout layout(cast<ModuleOp>(getOperation()));
+    for (auto index : indices) {
+      if (auto v = dyn_cast<Value>(index)) {
+        auto maybe = constructAffineMap(v, dimIndex);
+        if (!maybe)
+          return std::nullopt;
+
+        const AffineResult &result = *maybe;
+        expr = expr + result.expr * layout.getTypeSize(elementType);
+        constraint = constraint.intersect(result.constraint);
+        
+        if (isa<LLVM::LLVMStructType>(elementType))
+          return std::nullopt;
+        elementType = TypeSwitch<Type, Type>(elementType)
+          .Case([](LLVM::LLVMArrayType t) { return t.getElementType(); })
+          .Default([](Type t) { return t; });
+        // Create the constraint suhc that the entire sum should not overflow.
+        if (failed(populateConstraint(expr, numSymbols, v.getType(), constraint)))
+          return std::nullopt;
+      }
+      // TODO: IntegerAttr case
+    }
     return AffineResult { expr, constraint };
   }
   return std::nullopt;
@@ -333,6 +380,13 @@ Value ArithToAffinePass::lift(Value value) {
   return apply;
 }
 
+Value findGEPBase(Value addr) {
+  if (auto gep = dyn_cast<LLVM::GEPOp>(addr.getDefiningOp()))
+    return findGEPBase(gep.getBase());
+
+  return addr;
+}
+
 void ArithToAffinePass::runOnOperation() {
   // Collect loads and stores and attempt to lift them.
   // For now we consider only indexed load/stores. LLVM loads/stores can
@@ -344,12 +398,33 @@ void ArithToAffinePass::runOnOperation() {
         tolift.push_back(index);
       return;
     }
+
+    if (auto load = dyn_cast<LLVM::LoadOp>(op)) {
+      tolift.push_back(load);
+      return;
+    }
   });
 
   for (auto value : tolift) {
     if (auto cast = dyn_cast<arith::IndexCastOp>(value.getDefiningOp())) {
       if (auto apply = lift(cast.getOperand()))
         value.replaceAllUsesWith(apply);
+      continue;
+    }
+
+    if (auto load = dyn_cast<LLVM::LoadOp>(value.getDefiningOp())) {
+      OpBuilder builder(load);
+      auto addr = load.getAddr();
+      auto loc = load.getLoc();
+      if (auto apply = lift(addr)) {
+        auto gepBase = findGEPBase(addr);
+        // Workaround here since we don't have ptr_add as suggested.
+        auto i64 = LLVM::PtrToIntOp::create(builder, loc, builder.getI64Type(), gepBase);
+        auto cast = arith::IndexCastOp::create(builder, loc, builder.getI64Type(), apply);
+        auto add = LLVM::AddOp::create(builder, loc, i64, cast);
+        auto ptr = LLVM::IntToPtrOp::create(builder, loc, LLVM::LLVMPointerType::get(&getContext()), {add});
+        addr.replaceAllUsesWith(ptr);
+      }
     }
   }
 }
