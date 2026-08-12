@@ -61,7 +61,8 @@ void collectOperandsUpChain(Value value, SmallVector<Value> &operands) {
     return;
   }
 
-  if (isa<arith::ArithDialect>(def->getDialect()) || isa<LLVM::GEPOp>(def)) {
+  if (isa<arith::ArithDialect>(def->getDialect()) ||
+    isa<LLVM::GEPOp, LLVM::AddOp, LLVM::SubOp, LLVM::MulOp>(def)) {
     for (auto operand : def->getOperands())
       collectOperandsUpChain(operand, operands);
   } else {
@@ -205,7 +206,7 @@ std::optional<ArithToAffinePass::AffineResult> ArithToAffinePass::constructAffin
   // We only consider operations in the arith dialect.
   //
   // We check for binary operations here.
-  if (isa<arith::AddIOp, arith::SubIOp, arith::MulIOp>(def)) {
+  if (isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, LLVM::AddOp, LLVM::SubOp, LLVM::MulOp>(def)) {
     auto l = constructAffineMap(def->getOperand(0), dimIndex);
     auto r = constructAffineMap(def->getOperand(1), dimIndex);
     if (!l || !r)
@@ -215,6 +216,9 @@ std::optional<ArithToAffinePass::AffineResult> ArithToAffinePass::constructAffin
       .Case<arith::AddIOp>([&](arith::AddIOp) { return l->expr + r->expr; })
       .Case<arith::SubIOp>([&](arith::SubIOp) { return l->expr - r->expr; })
       .Case<arith::MulIOp>([&](arith::MulIOp) { return l->expr * r->expr; })
+      .Case<LLVM::AddOp>([&](LLVM::AddOp) { return l->expr + r->expr; })
+      .Case<LLVM::SubOp>([&](LLVM::SubOp) { return l->expr - r->expr; })
+      .Case<LLVM::MulOp>([&](LLVM::MulOp) { return l->expr * r->expr; })
       .DefaultUnreachable("constructAffineMap: should be exhaustive!");
 
     auto constraint = l->constraint.intersect(r->constraint);
@@ -418,12 +422,9 @@ void ArithToAffinePass::runOnOperation() {
       auto loc = load.getLoc();
       if (auto apply = lift(addr)) {
         auto gepBase = findGEPBase(addr);
-        // Workaround here since we don't have ptr_add as suggested.
-        auto i64 = LLVM::PtrToIntOp::create(builder, loc, builder.getI64Type(), gepBase);
         auto cast = arith::IndexCastOp::create(builder, loc, builder.getI64Type(), apply);
-        auto add = LLVM::AddOp::create(builder, loc, i64, cast);
-        auto ptr = LLVM::IntToPtrOp::create(builder, loc, LLVM::LLVMPointerType::get(&getContext()), {add});
-        addr.replaceAllUsesWith(ptr);
+        auto gep = LLVM::GEPOp::create(builder, loc, addr.getType(), builder.getI8Type(), gepBase, {cast});
+        addr.replaceAllUsesWith(gep);
       }
     }
   }
