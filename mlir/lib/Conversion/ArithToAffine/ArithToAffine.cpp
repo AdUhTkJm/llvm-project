@@ -6,6 +6,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/MemRef/IR/MemoryAccessOpInterfaces.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/Matchers.h"
@@ -28,7 +29,7 @@ namespace {
 struct ArithToAffinePass : impl::ConvertArithToAffineBase<ArithToAffinePass> {
   using Base::Base;
 
-  struct LiftResult {
+  struct AffineMapResult {
     SmallVector<Value> operands;
     AffineExpr expr;
     IntegerRelation constraint;
@@ -42,13 +43,20 @@ struct ArithToAffinePass : impl::ConvertArithToAffineBase<ArithToAffinePass> {
     IntegerRelation constraint;
   };
 
+  struct LiftResult {
+    Value apply;
+    Value condition;
+  };
+
   // Maps each affine value to its dimension index in a presburger relation.
   using DimIndex = llvm::DenseMap<Value, int>;
 
-  std::optional<LiftResult> valueToAffine(Value value);
+  std::optional<AffineMapResult> valueToAffine(Value value);
   std::optional<AffineResult> constructAffineMap(Value value, const DimIndex &dimIndex);
-  LiftResult tidyResult(const AffineResult &result, ValueRange operands);
-  Value lift(Value value);
+  AffineMapResult tidyResult(const AffineResult &result, ValueRange operands);
+  // Computes the offset and represent it as an affine map for `value`.
+  LiftResult lift(Value value);
+  Value synthesizeCheck(OpBuilder &builder, Location loc, const IntegerRelation &rel, ValueRange operands);
   void runOnOperation() override;
 };
 
@@ -144,7 +152,6 @@ DynamicAPInt pow(DynamicAPInt x, unsigned y) {
 }
 
 std::pair<DynamicAPInt, DynamicAPInt> getBounds(Type type) {
-  type.dump();
   assert(type.isInteger());
   unsigned width = type.getIntOrFloatBitWidth();
   if (type.isSignedInteger()) {
@@ -178,6 +185,65 @@ LogicalResult populateConstraint(AffineExpr expr, unsigned numSymbols, Type type
   constraint.addInequality(result);
   constraint.simplify();
   return success();
+}
+
+int log2(DynamicAPInt x) {
+  int v = 0;
+  while (x != 0) {
+    x /= 2;
+    v++;
+  }
+  return v;
+}
+
+Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc, const IntegerRelation &rel, ValueRange inOperands) {
+  // Compute the minimum and maximum for the operands.
+  using Bound = std::pair</*min*/DynamicAPInt, /*max*/DynamicAPInt>;
+  SmallVector<Bound> bounds;
+  SmallVector<Value> operands;
+
+  unsigned numOperands = inOperands.size();
+  bounds.reserve(numOperands);
+  operands.reserve(numOperands);
+  for (auto operand : inOperands) {
+    auto cast = llvm::cast<arith::IndexCastOp>(operand.getDefiningOp());
+    auto type = cast.getIn().getType();
+    bounds.push_back(getBounds(type));
+    operands.push_back(cast.getIn());
+  }
+
+  const auto synthesize = [&](bool isEq) {
+    unsigned numRows = isEq ? rel.getNumEqualities() : rel.getNumInequalities();
+    Value condition = arith::ConstantIntOp::create(builder, loc, builder.getI1Type(), 1);
+    for (unsigned i = 0; i < numRows; i++) {
+      auto row = isEq
+        ? rel.getEquality(i)
+        : rel.getInequality(i);
+
+      // Compute the maximum and minimum value given the bounds.
+      DynamicAPInt min(row.back()), max(row.back());
+      for (unsigned j = 0; j < numOperands; j++) {
+        min += row[j] * (row[j] < 0 ? bounds[j].second : bounds[j].first);
+        max += row[j] * (row[j] < 0 ? bounds[j].first : bounds[j].second);
+      }
+      int bitWidth = 1 + std::max(log2(min), log2(max));
+      Type intType = IntegerType::get(builder.getContext(), bitWidth);
+      auto zero = arith::ConstantIntOp::create(builder, loc, intType, 0);
+      Value v = zero;
+      for (unsigned j = 0; j < numOperands; j++) {
+        auto constant = arith::ConstantIntOp::create(builder, loc, intType, (int64_t) row[j]);
+        auto ext = arith::ExtSIOp::create(builder, loc, intType, operands[j]);
+        auto mul = arith::MulIOp::create(builder, loc, ext, constant);
+        v = arith::AddIOp::create(builder, loc, v, mul);
+      }
+      auto comparison = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::sge, v, zero);
+      condition = arith::AndIOp::create(builder, loc, condition, comparison);
+    }
+    return condition;
+  };
+  Value eqCond = synthesize(true);
+  Value ineqCond = synthesize(false);
+  return arith::AndIOp::create(builder, loc, eqCond, ineqCond);
 }
 
 std::optional<ArithToAffinePass::AffineResult> ArithToAffinePass::constructAffineMap(Value value, const DimIndex &dimIndex) {
@@ -265,7 +331,7 @@ std::optional<ArithToAffinePass::AffineResult> ArithToAffinePass::constructAffin
   return std::nullopt;
 }
 
-ArithToAffinePass::LiftResult ArithToAffinePass::tidyResult(const AffineResult &result, ValueRange operands) {
+ArithToAffinePass::AffineMapResult ArithToAffinePass::tidyResult(const AffineResult &result, ValueRange operands) {
   // No need to tidy expressions without operands.
   if (operands.empty())
     return { operands, result.expr, result.constraint };
@@ -335,12 +401,12 @@ ArithToAffinePass::LiftResult ArithToAffinePass::tidyResult(const AffineResult &
     }
   }
 
-  return LiftResult {
+  return AffineMapResult {
     symbols, expr, constraint
   };
 }
 
-std::optional<ArithToAffinePass::LiftResult> ArithToAffinePass::valueToAffine(Value value) {
+std::optional<ArithToAffinePass::AffineMapResult> ArithToAffinePass::valueToAffine(Value value) {
   // We trace back the arithmetic computations of the given value till a valid symbol.
   // If eventually we failed to hit anything convertible to symbol, we abort.
   SmallVector<Value> operands;
@@ -364,11 +430,11 @@ std::optional<ArithToAffinePass::LiftResult> ArithToAffinePass::valueToAffine(Va
   return tidyResult(*maybeResult, operands);
 }
 
-Value ArithToAffinePass::lift(Value value) {
+ArithToAffinePass::LiftResult ArithToAffinePass::lift(Value value) {
   auto liftResult = valueToAffine(value);
   // Give up lifting if we cannot make it affine.
   if (!liftResult)
-    return Value();
+    return { Value(), Value() };
 
   // Construct an `affine.apply` with the given symbols and affine map.
   MLIRContext *ctx = value.getContext();
@@ -376,12 +442,10 @@ Value ArithToAffinePass::lift(Value value) {
   builder.setInsertionPointAfterValue(value);
   auto loc = value.getLoc();
   auto affineMap = AffineMap::get(0, liftResult->operands.size(), liftResult->expr);
-  auto apply = affine::AffineApplyOp::create(builder, loc, builder.getIndexType(), affineMap, liftResult->operands);
-  llvm::errs() << "constraint:\n";
-  liftResult->constraint.dump();
-  llvm::errs() << "\n";
-
-  return apply;
+  Value apply = affine::AffineApplyOp::create(builder, loc, builder.getIndexType(), affineMap, liftResult->operands);
+  Value condition = synthesizeCheck(builder, loc, liftResult->constraint, liftResult->operands);
+  
+  return { apply, condition };
 }
 
 Value findGEPBase(Value addr) {
@@ -410,21 +474,20 @@ void ArithToAffinePass::runOnOperation() {
   });
 
   for (auto value : tolift) {
-    if (auto cast = dyn_cast<arith::IndexCastOp>(value.getDefiningOp())) {
-      if (auto apply = lift(cast.getOperand()))
-        value.replaceAllUsesWith(apply);
-      continue;
-    }
-
     if (auto load = dyn_cast<LLVM::LoadOp>(value.getDefiningOp())) {
       OpBuilder builder(load);
       auto addr = load.getAddr();
       auto loc = load.getLoc();
-      if (auto apply = lift(addr)) {
-        auto gepBase = findGEPBase(addr);
-        auto cast = arith::IndexCastOp::create(builder, loc, builder.getI64Type(), apply);
-        auto gep = LLVM::GEPOp::create(builder, loc, addr.getType(), builder.getI8Type(), gepBase, {cast});
-        addr.replaceAllUsesWith(gep);
+      if (auto result = lift(addr); result.apply) {
+        auto branch = scf::IfOp::create(builder, loc, result.condition, [&](OpBuilder &builder, Location loc) {
+          auto gepBase = findGEPBase(addr);
+          auto cast = arith::IndexCastOp::create(builder, loc, builder.getI64Type(), result.apply);
+          auto gep = LLVM::GEPOp::create(builder, loc, addr.getType(), builder.getI8Type(), gepBase, {cast});
+          scf::YieldOp::create(builder, loc, gep.getResult());
+        }, [&](OpBuilder &builder, Location loc) {
+          scf::YieldOp::create(builder ,loc, addr);
+        });
+        load.setOperand(branch.getResult(0));
       }
     }
   }
