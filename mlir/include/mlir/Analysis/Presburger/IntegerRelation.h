@@ -662,7 +662,7 @@ public:
   /// to perform much better in the average case. If V is the number of vertices
   /// in the polytope and C is the number of constraints, the algorithm takes
   /// O(VC) time.
-  void removeRedundantConstraints();
+  bool removeRedundantConstraints();
 
   void removeDuplicateDivs();
 

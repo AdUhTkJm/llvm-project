@@ -1224,13 +1224,14 @@ void IntegerRelation::removeRedundantInequalities() {
 
 // A more complex check to eliminate redundant inequalities and equalities. Uses
 // Simplex to check if a constraint is redundant.
-void IntegerRelation::removeRedundantConstraints() {
+bool IntegerRelation::removeRedundantConstraints() {
   // First, we run gcdTightenInequalities. This allows us to catch some
   // constraints which are not redundant when considering rational solutions
   // but are redundant in terms of integer solutions.
   gcdTightenInequalities();
   Simplex simplex(*this);
   simplex.detectRedundant();
+  bool changed = false;
 
   unsigned pos = 0;
   unsigned numIneqs = getNumInequalities();
@@ -1240,6 +1241,7 @@ void IntegerRelation::removeRedundantConstraints() {
     if (!simplex.isMarkedRedundant(r))
       inequalities.copyRow(r, pos++);
   }
+  changed = changed || (pos != numIneqs);
   inequalities.resizeVertically(pos);
 
   // Scan to get rid of all equalities marked redundant, in-place. In Simplex,
@@ -1247,12 +1249,15 @@ void IntegerRelation::removeRedundantConstraints() {
   // An equality is redundant if both the inequalities in its pair are
   // redundant.
   pos = 0;
-  for (unsigned r = 0, e = getNumEqualities(); r < e; r++) {
+  unsigned numEqs = getNumEqualities();
+  for (unsigned r = 0; r < numEqs; r++) {
     if (!(simplex.isMarkedRedundant(numIneqs + 2 * r) &&
           simplex.isMarkedRedundant(numIneqs + 2 * r + 1)))
       equalities.copyRow(r, pos++);
   }
+  changed = changed || (pos != numEqs);
   equalities.resizeVertically(pos);
+  return changed;
 }
 
 std::optional<DynamicAPInt> IntegerRelation::computeVolume() const {
@@ -1424,6 +1429,7 @@ void IntegerRelation::simplify() {
     normalizeConstraintsByGCD();
     changed |= gaussianEliminate();
     changed |= removeDuplicateConstraints();
+    changed |= removeRedundantConstraints();
   }
   // Current set is not empty.
 }
