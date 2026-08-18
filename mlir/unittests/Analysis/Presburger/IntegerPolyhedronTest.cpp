@@ -594,6 +594,45 @@ TEST(IntegerPolyhedronTest, removeRedundantConstraintsTest) {
   }
 }
 
+TEST(IntegerPolyhedronTest, removeRedundantConstraintsWhenTest) {
+  // x - 2 >= 0 is redundant given x >= 5, while -x + 10 >= 0 is not.
+  IntegerPolyhedron poly =
+      parseIntegerPolyhedron("(x) : (x - 2 >= 0, -x + 10 >= 0)");
+  IntegerPolyhedron ref = parseIntegerPolyhedron("(x) : (x - 5 >= 0)");
+  EXPECT_TRUE(poly.removeRedundantConstraintsWhen(ref));
+  EXPECT_EQ(poly.getNumInequalities(), 1u);
+  EXPECT_THAT(poly.getInequality(0), ElementsAre(-1, 10));
+  EXPECT_EQ(poly.getNumEqualities(), 0u);
+  // The reference itself is unaffected.
+  EXPECT_EQ(ref.getNumInequalities(), 1u);
+
+  // Without the reference, neither constraint is redundant.
+  IntegerPolyhedron poly2 =
+      parseIntegerPolyhedron("(x) : (x - 2 >= 0, -x + 10 >= 0)");
+  IntegerPolyhedron universe = parseIntegerPolyhedron("(x) : ()");
+  EXPECT_FALSE(poly2.removeRedundantConstraintsWhen(universe));
+  EXPECT_EQ(poly2.getNumInequalities(), 2u);
+
+  // An equality of the relation is redundant if it is already implied by the
+  // reference. The inequality x + y >= 0 is not implied.
+  IntegerPolyhedron poly3 =
+      parseIntegerPolyhedron("(x, y) : (x - y == 0, x + y >= 0)");
+  IntegerPolyhedron ref3 = parseIntegerPolyhedron("(x, y) : (x - y == 0)");
+  EXPECT_TRUE(poly3.removeRedundantConstraintsWhen(ref3));
+  EXPECT_EQ(poly3.getNumEqualities(), 0u);
+  EXPECT_EQ(poly3.getNumInequalities(), 1u);
+  EXPECT_THAT(poly3.getInequality(0), ElementsAre(1, 1, 0));
+
+  // Redundancy among the constraints of the reference must not cause any
+  // constraint of the relation to be removed.
+  IntegerPolyhedron poly4 =
+      parseIntegerPolyhedron("(x, y) : (x >= 0, y >= 0, x + y - 1 >= 0)");
+  IntegerPolyhedron ref4 = parseIntegerPolyhedron(
+      "(x, y) : (x + y + 100 >= 0, 2 * x + 2 * y + 200 >= 0)");
+  EXPECT_FALSE(poly4.removeRedundantConstraintsWhen(ref4));
+  EXPECT_EQ(poly4.getNumInequalities(), 3u);
+}
+
 TEST(IntegerPolyhedronTest, addConstantUpperBound) {
   IntegerPolyhedron poly(PresburgerSpace::getSetSpace(2));
   poly.addBound(BoundType::UB, 0, 1);

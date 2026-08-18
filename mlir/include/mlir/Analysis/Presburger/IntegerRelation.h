@@ -664,6 +664,15 @@ public:
   /// O(VC) time.
   bool removeRedundantConstraints();
 
+  /// Removes constraints of this relation that are redundant given that the
+  /// variables are known to satisfy `reference`, i.e., constraints that are
+  /// implied by the remaining constraints of this relation together with the
+  /// constraints of `reference`. The constraints of `reference` itself are
+  /// never removed since they are not part of this relation. The spaces of
+  /// both relations should be compatible. Returns whether any constraint was
+  /// removed.
+  bool removeRedundantConstraintsWhen(const IntegerRelation &reference);
+
   void removeDuplicateDivs();
 
   /// Simplify the constraint system by removing canonicalizing constraints and
