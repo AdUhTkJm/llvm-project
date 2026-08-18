@@ -1,16 +1,21 @@
 #include "mlir/Conversion/ArithToAffine/ArithToAffine.h"
 
+#include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
+#include "mlir/Analysis/DataFlow/IntegerRangeAnalysis.h"
+#include "mlir/Analysis/DataFlow/Utils.h"
 #include "mlir/Analysis/Presburger/IntegerRelation.h"
 #include "mlir/Analysis/Presburger/PresburgerSpace.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/MemRef/IR/MemoryAccessOpInterfaces.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
+#include "mlir/Interfaces/ValueBoundsOpInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DynamicAPInt.h"
 #include "llvm/ADT/STLExtras.h"
@@ -54,10 +59,26 @@ struct ArithToAffinePass : impl::ConvertArithToAffineBase<ArithToAffinePass> {
   std::optional<AffineMapResult> valueToAffine(Value value);
   std::optional<AffineResult> constructAffineMap(Value value, const DimIndex &dimIndex);
   AffineMapResult tidyResult(const AffineResult &result, ValueRange operands);
+  // Adds rows to `rel` bounding the variable at position `pos`, which
+  // corresponds to `value`, based on the integer range analysis result.
+  void addAnalyzedRangeConstraints(Value value, unsigned pos, IntegerRelation &rel) const;
+  // Adds rows to `reference` bounding the symbol at position `pos`, which
+  // corresponds to `value`, based on bounds computed via
+  // ValueBoundsOpInterface (e.g. the bounds of an scf.for induction variable
+  // in terms of the loop bounds). `valueToSymbol` maps each lifted operand
+  // to its symbol position in `reference`.
+  void addValueBoundsConstraints(Value value, unsigned pos, const DenseMap<Value, unsigned> &valueToSymbol, IntegerRelation &reference) const;
+  void getDependentDialects(DialectRegistry &registry) const override {
+    impl::ConvertArithToAffineBase<ArithToAffinePass>::getDependentDialects(registry);
+    scf::registerValueBoundsOpInterfaceExternalModels(registry);
+  }
   // Computes the offset and represent it as an affine map for `value`.
   LiftResult lift(Value value);
   Value synthesizeCheck(OpBuilder &builder, Location loc, const IntegerRelation &rel, ValueRange operands);
   void runOnOperation() override;
+
+private:
+  mlir::DataFlowSolver *solver;
 };
 
 // We eagerly collect operands up to the point where we either
@@ -236,6 +257,8 @@ Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc, const
         auto mul = arith::MulIOp::create(builder, loc, ext, constant);
         v = arith::AddIOp::create(builder, loc, v, mul);
       }
+      Value final = arith::ConstantIntOp::create(builder, loc, intType, (int64_t) row.back());
+      v = arith::AddIOp::create(builder, loc, v, final);
       auto comparison = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::sge, v, zero);
       condition = arith::AndIOp::create(builder, loc, condition, comparison);
     }
@@ -387,7 +410,7 @@ ArithToAffinePass::AffineMapResult ArithToAffinePass::tidyResult(const AffineRes
   auto loc = operands[0].getLoc();
   SmallVector<Value> symbols;
   // For every related operand, cast them to index if they aren't already.
-  // TODO: deduplicate these casts.
+  // We could potentially deduplicate these casts, but it's also possible to leave them for CSE.
   for (auto [i, v] : llvm::enumerate(operands)) {
     if (!used.contains(i))
       continue;
@@ -401,9 +424,184 @@ ArithToAffinePass::AffineMapResult ArithToAffinePass::tidyResult(const AffineRes
     }
   }
 
+  // Remove rows of constraints that are already implied by facts known about
+  // the operands: their analyzed integer ranges, and bounds obtained via
+  // ValueBoundsOpInterface (e.g. an scf.for induction variable is bounded by
+  // the loop bounds).
+  IntegerRelation reference(PresburgerSpace::getSetSpace(numLeft));
+  DenseMap<Value, unsigned> valueToSymbol;
+  for (auto [before, after] : indexMap)
+    valueToSymbol.try_emplace(operands[before], after);
+  for (unsigned i = 0; i < numOperands; i++) {
+    auto it = indexMap.find(i);
+    if (it == indexMap.end())
+      continue;
+    addAnalyzedRangeConstraints(operands[i], it->second, reference);
+    // addValueBoundsConstraints(operands[i], it->second, valueToSymbol, reference);
+  }
+  constraint.removeRedundantConstraintsWhen(reference);
+
   return AffineMapResult {
     symbols, expr, constraint
   };
+}
+
+// Adds `min <= var[pos] <= max` rows to `rel`.
+void addConstantBounds(IntegerRelation &rel, unsigned pos,
+                              const DynamicAPInt &min, const DynamicAPInt &max) {
+  SmallVector<DynamicAPInt> lower(rel.getNumVars() + 1);
+  lower[pos] = DynamicAPInt(1);
+  lower.back() = -min;
+  rel.addInequality(lower);
+  SmallVector<DynamicAPInt> upper(rel.getNumVars() + 1);
+  upper[pos] = DynamicAPInt(-1);
+  upper.back() = max;
+  rel.addInequality(upper);
+}
+
+void ArithToAffinePass::addAnalyzedRangeConstraints(Value value, unsigned pos, IntegerRelation &rel) const {
+  auto *lattice =
+      solver->lookupState<dataflow::IntegerValueRangeLattice>(value);
+  if (!lattice || lattice->getValue().isUninitialized())
+    return;
+
+  // The symbol is the sign-extended index-cast of `value`, so it is bounded
+  // by the signed range of `value`.
+  const ConstantIntRanges &range = lattice->getValue().getValue();
+  addConstantBounds(rel, pos, DynamicAPInt(range.smin()),
+                    DynamicAPInt(range.smax()));
+}
+
+// Returns the operation that a ValueBoundsOpInterface query for `value`
+// should be directed to: the defining operation for an op result, or the
+// operation owning the region for a block argument.
+static Operation *getOwnerOfValue(Value value) {
+  if (auto arg = dyn_cast<BlockArgument>(value)) {
+    Region *region = arg.getOwner()->getParent();
+    return region ? region->getParentOp() : nullptr;
+  }
+  return value.getDefiningOp();
+}
+
+void ArithToAffinePass::addValueBoundsConstraints(Value value, unsigned pos, const DenseMap<Value, unsigned> &valueToSymbol, IntegerRelation &reference) const {
+  // Bounds can only be computed for index/integer-typed values, and require
+  // the owner of the value to implement ValueBoundsOpInterface (e.g. an
+  // scf.for loop for its induction variable).
+  if (!value.getType().isIntOrIndex())
+    return;
+  Operation *owner = getOwnerOfValue(value);
+  if (!owner || !isa<ValueBoundsOpInterface>(owner))
+    return;
+
+  MLIRContext *ctx = value.getContext();
+  ValueBoundsOptions options;
+  options.allowIntegerType = true;
+
+  // Stop the backward traversal at values that the bound should be expressed
+  // in terms of: lifted operands (which have symbols in `reference`) and
+  // values that cannot be analyzed further. Never stop at the queried value
+  // itself.
+  auto stopCondition = [&](Value v, std::optional<int64_t> dim,
+                           ValueBoundsConstraintSet &) {
+    if (v == value)
+      return false;
+    if (valueToSymbol.contains(v))
+      return true;
+    Operation *owner = getOwnerOfValue(v);
+    return !owner || !isa<ValueBoundsOpInterface>(owner);
+  };
+
+  unsigned numSyms = reference.getNumVars();
+  // Constraints derived from the computed bounds, over the reference symbols
+  // plus local variables for bound operands without a corresponding symbol.
+  IntegerRelation fragment(PresburgerSpace::getSetSpace(numSyms));
+  // Maps bound operands (value/dim pairs) to their local variable position
+  // in `fragment`.
+  SmallVector<std::pair<std::pair<Value, std::optional<int64_t>>, unsigned>> locals;
+
+  ValueBoundsConstraintSet::Variable var(value);
+  for (BoundType type : {BoundType::LB, BoundType::UB}) {
+    AffineMap boundMap;
+    ValueDimList mapOperands;
+    if (failed(ValueBoundsConstraintSet::computeBound(boundMap, mapOperands,
+                                                      type, var, stopCondition,
+                                                      options)))
+      continue;
+
+    // Convert the dimensions of the map to symbols: both dimensions and
+    // symbols correspond to entries of `mapOperands`.
+    unsigned numMapOperands = boundMap.getNumDims() + boundMap.getNumSymbols();
+    SmallVector<AffineExpr> dimReplacements, symReplacements;
+    for (unsigned i = 0; i < boundMap.getNumDims(); i++)
+      dimReplacements.push_back(getAffineSymbolExpr(i, ctx));
+    for (unsigned i = 0; i < boundMap.getNumSymbols(); i++)
+      symReplacements.push_back(
+          getAffineSymbolExpr(boundMap.getNumDims() + i, ctx));
+    AffineExpr boundExpr = boundMap.getResult(0).replaceDimsAndSymbols(
+        dimReplacements, symReplacements);
+
+    // The computed bound is not necessarily affine (e.g. it may contain a
+    // floordiv with a non-constant divisor); skip such bounds.
+    std::optional<IntVector> maybeCoeffs =
+        extractCoefficients(boundExpr, numMapOperands);
+    if (!maybeCoeffs)
+      continue;
+    const IntVector &coeffs = *maybeCoeffs;
+
+    // Assign a column to each bound operand: the symbol of the corresponding
+    // lifted operand if there is one, or a fresh local variable otherwise.
+    SmallVector<unsigned> columns(numMapOperands);
+    for (unsigned k = 0; k < numMapOperands; k++) {
+      if (coeffs[k] == 0)
+        continue;
+      const std::pair<Value, std::optional<int64_t>> &valueDim = mapOperands[k];
+      if (!valueDim.second) {
+        auto it = valueToSymbol.find(valueDim.first);
+        if (it != valueToSymbol.end()) {
+          columns[k] = it->second;
+          continue;
+        }
+      }
+      auto *it = llvm::find_if(locals, [&](const auto &entry) {
+        return entry.first == valueDim;
+      });
+      if (it == locals.end()) {
+        unsigned localPos = numSyms + fragment.getNumLocalVars();
+        fragment.appendVar(VarKind::Local);
+        // Constrain the local variable with the analyzed range of the value.
+        if (!valueDim.second)
+          addAnalyzedRangeConstraints(valueDim.first, localPos, fragment);
+        it = std::prev(locals.insert(locals.end(), {valueDim, localPos}));
+      }
+      columns[k] = it->second;
+    }
+
+    // Lower bound: `value >= bound`, i.e. `symbol - bound >= 0`.
+    // Upper bound (closed): `value <= bound`, i.e. `bound - symbol >= 0`.
+    DynamicAPInt sign(type == BoundType::LB ? 1 : -1);
+    SmallVector<DynamicAPInt> row(fragment.getNumVars() + 1);
+    row[pos] = sign;
+    for (unsigned k = 0; k < numMapOperands; k++) {
+      if (coeffs[k] == 0)
+        continue;
+      row[columns[k]] -= coeffs[k] * sign;
+    }
+    row.back() -= coeffs.back() * sign;
+    fragment.addInequality(row);
+  }
+
+  if (fragment.getNumInequalities() == 0)
+    return;
+
+  // Project out the local variables. What remains are constraints over the
+  // reference symbols only, which are valid consequences of the computed
+  // bounds and the analyzed ranges.
+  for (unsigned i = 0, e = fragment.getNumLocalVars(); i < e; i++)
+    fragment.projectOut(fragment.getNumDimAndSymbolVars());
+  fragment.removeTrivialRedundancy();
+
+  for (unsigned i = 0, e = fragment.getNumInequalities(); i < e; i++)
+    reference.addInequality(fragment.getInequality(i));
 }
 
 std::optional<ArithToAffinePass::AffineMapResult> ArithToAffinePass::valueToAffine(Value value) {
@@ -449,6 +647,9 @@ ArithToAffinePass::LiftResult ArithToAffinePass::lift(Value value) {
 }
 
 Value findGEPBase(Value addr) {
+  if (isa<BlockArgument>(addr))
+    return addr;
+
   if (auto gep = dyn_cast<LLVM::GEPOp>(addr.getDefiningOp()))
     return findGEPBase(gep.getBase());
 
@@ -456,11 +657,21 @@ Value findGEPBase(Value addr) {
 }
 
 void ArithToAffinePass::runOnOperation() {
+  mlir::DataFlowSolver mySolver;
+  solver = &mySolver;
+  Operation *module = getOperation();
+
+  dataflow::loadBaselineAnalyses(*solver);
+  solver->load<mlir::dataflow::IntegerRangeAnalysis>();
+  if (failed(solver->initializeAndRun(module)))
+    // TODO: This should still work but less accurate.
+    return;
+  
   // Collect loads and stores and attempt to lift them.
   // For now we consider only indexed load/stores. LLVM loads/stores can
   // wait for later.
   SmallVector<Value> tolift;
-  getOperation()->walk([&](Operation *op) {
+  module->walk([&](Operation *op) {
     if (auto indexed = dyn_cast<memref::IndexedAccessOpInterface>(op)) {
       for (auto index : indexed.getIndices())
         tolift.push_back(index);

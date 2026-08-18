@@ -1260,6 +1260,54 @@ bool IntegerRelation::removeRedundantConstraints() {
   return changed;
 }
 
+// A variant of removeRedundantConstraints where a constraint of `this` is
+// considered redundant if it is implied by the remaining constraints of
+// `this` together with the constraints of `reference`.
+bool IntegerRelation::removeRedundantConstraintsWhen(
+    const IntegerRelation &reference) {
+  assert(space.isCompatible(reference.getSpace()) &&
+         "Spaces must be compatible.");
+  gcdTightenInequalities();
+  // In the Simplex constructed below, the first constraints added are the
+  // inequalities, followed by a pair of constraints for each equality. Since
+  // `intersect` appends the constraints of `reference` after those of `this`,
+  // the constraints originating from `this` occupy the indices [0, numIneqs)
+  // among the inequalities and [numIneqs + numRefIneqs, numIneqs +
+  // numRefIneqs + 2 * numEqs) among the equality pairs. We run redundancy
+  // detection only on these indices, so that the constraints of `reference`
+  // are always respected as context and never considered for removal.
+  IntegerRelation combined = intersect(reference);
+  Simplex simplex(combined);
+
+  unsigned numIneqs = getNumInequalities();
+  unsigned numEqs = getNumEqualities();
+  unsigned numRefIneqs = reference.getNumInequalities();
+  simplex.detectRedundant(/*offset=*/0, /*count=*/numIneqs);
+  simplex.detectRedundant(/*offset=*/numIneqs + numRefIneqs,
+                          /*count=*/2 * numEqs);
+
+  bool changed = false;
+  unsigned pos = 0;
+  for (unsigned r = 0; r < numIneqs; r++) {
+    if (!simplex.isMarkedRedundant(r))
+      inequalities.copyRow(r, pos++);
+  }
+  changed = changed || (pos != numIneqs);
+  inequalities.resizeVertically(pos);
+
+  // An equality is redundant if both the inequalities in its pair are
+  // redundant.
+  pos = 0;
+  for (unsigned r = 0; r < numEqs; r++) {
+    if (!(simplex.isMarkedRedundant(numIneqs + numRefIneqs + 2 * r) &&
+          simplex.isMarkedRedundant(numIneqs + numRefIneqs + 2 * r + 1)))
+      equalities.copyRow(r, pos++);
+  }
+  changed = changed || (pos != numEqs);
+  equalities.resizeVertically(pos);
+  return changed;
+}
+
 std::optional<DynamicAPInt> IntegerRelation::computeVolume() const {
   assert(getNumSymbolVars() == 0 && "Symbols are not yet supported!");
 

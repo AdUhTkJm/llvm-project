@@ -15,5 +15,7 @@ add_mlir_conversion_library(MLIRArithToAffine
   MLIRArithDialect
   MLIRArithUtils
   MLIRPass
+  MLIRSCFDialect
   MLIRTransforms
+  MLIRValueBoundsOpInterface
   )
