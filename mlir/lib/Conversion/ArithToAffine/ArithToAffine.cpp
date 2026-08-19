@@ -1,6 +1,5 @@
 #include "mlir/Conversion/ArithToAffine/ArithToAffine.h"
 
-#include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Analysis/DataFlow/IntegerRangeAnalysis.h"
 #include "mlir/Analysis/DataFlow/Utils.h"
 #include "mlir/Analysis/Presburger/IntegerRelation.h"
@@ -31,6 +30,38 @@ using namespace mlir::presburger;
 
 namespace {
 
+// A pair of constraints on the symbols of an affine expression,
+// under signed and unsigned interpretation of the intermediate integer
+// values respectively.
+struct ConstraintPair {
+  IntegerRelation sign;
+  IntegerRelation unsign;
+
+  ConstraintPair(const PresburgerSpace &space)
+      : sign(IntegerRelation::getUniverse(space)),
+        unsign(IntegerRelation::getUniverse(space)) {}
+  ConstraintPair(const IntegerRelation &signedConstraint,
+                 const IntegerRelation &unsignedConstraint)
+      : sign(signedConstraint),
+        unsign(unsignedConstraint) {}
+
+  ConstraintPair intersect(const ConstraintPair &other) const {
+    return { sign.intersect(other.sign), unsign.intersect(other.unsign) };
+  }
+
+  // Pins both interpretations to signed.
+  ConstraintPair toSigned() const { return { sign, sign }; }
+  // Pins both interpretations to unsigned.
+  ConstraintPair toUnsigned() const { return { unsign, unsign }; }
+
+  void dump() const {
+    llvm::errs() << "signed:\n";
+    sign.dump();
+    llvm::errs() << "\nunsigned:\n";
+    unsign.dump();
+  }
+};
+
 struct ArithToAffinePass : impl::ConvertArithToAffineBase<ArithToAffinePass> {
   using Base::Base;
 
@@ -44,8 +75,8 @@ struct ArithToAffinePass : impl::ConvertArithToAffineBase<ArithToAffinePass> {
     // The affine expression from symbols to the value.
     AffineExpr expr;
     // The constraints on the symbols such that intermediate results will
-    // not overflow.
-    IntegerRelation constraint;
+    // not overflow, under both signed and unsigned interpretations.
+    ConstraintPair constraint;
   };
 
   struct LiftResult {
@@ -184,15 +215,29 @@ std::pair<DynamicAPInt, DynamicAPInt> getBounds(Type type) {
   return { DynamicAPInt(0), power-1 };
 }
 
-LogicalResult populateConstraint(AffineExpr expr, unsigned numSymbols, Type type, IntegerRelation &constraint) {
+// The bounds of an integer type under signed interpretation.
+std::pair<DynamicAPInt, DynamicAPInt> getSignedBounds(Type type) {
+  assert(type.isInteger());
+  unsigned width = type.getIntOrFloatBitWidth();
+  auto power = pow(DynamicAPInt(2), width-1);
+  return { -power, power-1 };
+}
+
+// The bounds of an integer type under unsigned interpretation.
+std::pair<DynamicAPInt, DynamicAPInt> getUnsignedBounds(Type type) {
+  assert(type.isInteger());
+  unsigned width = type.getIntOrFloatBitWidth();
+  auto power = pow(DynamicAPInt(2), width);
+  return { DynamicAPInt(0), power-1 };
+}
+
+// Adds rows `min <= expr <= max` to `constraint`.
+LogicalResult addBoundRows(AffineExpr expr, unsigned numSymbols, const DynamicAPInt &min, const DynamicAPInt &max, IntegerRelation &constraint) {
   auto maybeSum = extractCoefficients(expr, numSymbols);
   if (!maybeSum)
     return failure();
 
   IntVector result = *maybeSum;
-  // We must guarantee that the result does not overflow.
-  // That is, min <= result <= max.
-  auto [min, max] = getBounds(type);
   // IntegerRelations expect constraints of form `row >= 0`.
   // First add a row for `result - min >= 0`.
   result.back() -= min;
@@ -206,6 +251,17 @@ LogicalResult populateConstraint(AffineExpr expr, unsigned numSymbols, Type type
   constraint.addInequality(result);
   constraint.simplify();
   return success();
+}
+
+// We must guarantee that the result does not overflow under both signed and
+// unsigned interpretations of its type.
+LogicalResult populateConstraint(AffineExpr expr, unsigned numSymbols, Type type, ConstraintPair &constraint) {
+  auto [smin, smax] = getSignedBounds(type);
+  if (failed(addBoundRows(expr, numSymbols, smin, smax, constraint.sign)))
+    return failure();
+
+  auto [umin, umax] = getUnsignedBounds(type);
+  return addBoundRows(expr, numSymbols, umin, umax, constraint.unsign);
 }
 
 int log2(DynamicAPInt x) {
@@ -270,9 +326,10 @@ Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc, const
 }
 
 std::optional<ArithToAffinePass::AffineResult> ArithToAffinePass::constructAffineMap(Value value, const DimIndex &dimIndex) {
+  llvm::errs() << "looking at " << value << "\n";
   unsigned numSymbols = dimIndex.size();
   PresburgerSpace space = PresburgerSpace::getSetSpace(numSymbols);
-  auto universe = IntegerRelation::getUniverse(space);
+  ConstraintPair universe(space);
   MLIRContext *ctx = value.getContext();
 
   llvm::APInt stepValue;
@@ -316,16 +373,26 @@ std::optional<ArithToAffinePass::AffineResult> ArithToAffinePass::constructAffin
 
     return AffineResult { expr, constraint };
   }
+  
   if (isa<arith::ExtSIOp, arith::ExtUIOp>(def)) {
-    // This never imposes any extra constraint.
-    return constructAffineMap(def->getOperand(0), dimIndex);
+    // The extension itself never imposes any extra constraints, but it pins
+    // the interpretation of everything computed so far: signed for extsi
+    // and unsigned for extui.
+    auto result = constructAffineMap(def->getOperand(0), dimIndex);
+    if (!result)
+      return std::nullopt;
+    def->dump();
+    result->constraint = isa<arith::ExtSIOp>(def)
+      ? result->constraint.toSigned()
+      : result->constraint.toUnsigned();
+    return result;
   }
 
   if (auto gep = dyn_cast<LLVM::GEPOp>(def)) {
     auto indices = gep.getIndices();
     Type elementType = gep.getElemType();
     AffineExpr expr = getAffineConstantExpr(0, ctx);
-    IntegerRelation constraint(PresburgerSpace::getSetSpace(numSymbols));
+    ConstraintPair constraint(space);
     // We constraint on the sum only.
     DataLayout layout(cast<ModuleOp>(getOperation()));
     for (auto index : indices) {
@@ -349,15 +416,23 @@ std::optional<ArithToAffinePass::AffineResult> ArithToAffinePass::constructAffin
       }
       // TODO: IntegerAttr case
     }
-    return AffineResult { expr, constraint };
+    // GEP always treats its offsets as signed.
+    return AffineResult { expr, constraint.toSigned() };
   }
   return std::nullopt;
 }
 
 ArithToAffinePass::AffineMapResult ArithToAffinePass::tidyResult(const AffineResult &result, ValueRange operands) {
+  // The final constraint is the unsigned one: values are interpreted as
+  // unsigned by default. When we meet extui/extsi operations, both constraints
+  // are pinned to the correct one, so it is safe to take the unsigned one out.
+  llvm::errs() << "final:\n";
+  result.constraint.dump();
+  const IntegerRelation &resultConstraint = result.constraint.unsign;
+
   // No need to tidy expressions without operands.
   if (operands.empty())
-    return { operands, result.expr, result.constraint };
+    return { operands, result.expr, resultConstraint };
 
   // Compute unused indices.
   unsigned numOperands = operands.size();
@@ -388,12 +463,12 @@ ArithToAffinePass::AffineMapResult ArithToAffinePass::tidyResult(const AffineRes
   const auto removeColumn = [&](bool isEq) {
     SmallVector<DynamicAPInt> x(numLeft + 1);
     unsigned size = isEq
-      ? result.constraint.getNumEqualities()
-      : result.constraint.getNumInequalities();
+      ? resultConstraint.getNumEqualities()
+      : resultConstraint.getNumInequalities();
     for (unsigned i = 0; i < size; i++) {
       auto row = isEq
-        ? result.constraint.getEquality(i)
-        : result.constraint.getInequality(i);
+        ? resultConstraint.getEquality(i)
+        : resultConstraint.getInequality(i);
       for (auto [before, after] : indexMap)
         x[after] = row[before];
       x.back() = row.back();
@@ -437,8 +512,10 @@ ArithToAffinePass::AffineMapResult ArithToAffinePass::tidyResult(const AffineRes
     if (it == indexMap.end())
       continue;
     addAnalyzedRangeConstraints(operands[i], it->second, reference);
-    // addValueBoundsConstraints(operands[i], it->second, valueToSymbol, reference);
+    addValueBoundsConstraints(operands[i], it->second, valueToSymbol, reference);
   }
+  llvm::errs() << "reference:\n";
+  reference.dump();
   constraint.removeRedundantConstraintsWhen(reference);
 
   return AffineMapResult {
