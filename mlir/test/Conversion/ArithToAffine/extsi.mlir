@@ -2,11 +2,11 @@
 
 // The sign extension pins the interpretation of the computation of the GEP
 // index to signed, so the synthesized overflow checks use the signed bounds
-// of i32: 0 <= %arg0 + %arg1 (from the unsigned GEP expression, after GCD
-// normalization) and %arg0 + %arg1 <= 2147483647 (signed max of i32).
+// of i32: -2147483648 <= %arg0 + %arg1 <= 2147483647.
 
 // CHECK-LABEL: llvm.func @load_extsi(
 // CHECK:         affine.apply
+// CHECK:         arith.constant 2147483648 : i34
 // CHECK:         arith.cmpi sge
 // CHECK:         arith.constant 2147483647 : i34
 // CHECK:         arith.cmpi sge
