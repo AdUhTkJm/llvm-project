@@ -1,13 +1,19 @@
 // RUN: mlir-opt -convert-arith-to-affine %s | FileCheck %s
 
-// The zero extension pins the interpretation of the computation of the GEP
-// index to unsigned. The unsigned upper-bound check (%arg0 + %arg1 <=
-// 4294967295) is redundant given the analyzed ranges of the operands, so
-// only the lower-bound check %arg0 + %arg1 >= 0 is synthesized.
+// The zero extension is represented with a modulo by 2^32 in the affine map,
+// treating the signed symbols as unsigned. The overflow checks only need to
+// guarantee that the addition does not overflow under the signed
+// interpretation: -2147483648 <= %arg0 + %arg1 <= 2147483647. The rows
+// pinning the modulo's local variable hold by construction, and the bounds
+// of the GEP sum are implied by them, so no division is synthesized.
 
+// CHECK:       #map = affine_map<()[s0, s1] -> (((s0 + s1) mod 4294967296) * 4)>
 // CHECK-LABEL: llvm.func @load_extui(
 // CHECK:         affine.apply
-// CHECK-NOT:     arith.constant 4294967295
+// CHECK-NOT:     arith.divsi
+// CHECK:         arith.constant 2147483648 : i34
+// CHECK:         arith.cmpi sge
+// CHECK:         arith.constant 2147483647 : i34
 // CHECK:         arith.cmpi sge
 // CHECK-NOT:     arith.cmpi
 // CHECK:         scf.if
