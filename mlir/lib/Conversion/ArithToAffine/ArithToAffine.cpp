@@ -280,61 +280,25 @@ DynamicAPInt floordiv(const DynamicAPInt &x, const DynamicAPInt &y) {
   return x < 0 ? q - 1 : q;
 }
 
-// Shifts the local-variable columns of a coefficient vector that has `numSym`
-// leading symbol columns right by `shift`, inserting zeros.
-IntVector shiftLocalColumns(const IntVector &vec, unsigned numSym,
-                            unsigned shift) {
+// Shift elements starting from `n` by `shift` amount to the right. 
+IntVector shift(const IntVector &vec, unsigned n, unsigned shift) {
   IntVector result(vec.size() + shift);
-  for (unsigned i = 0; i < numSym; i++)
+  for (unsigned i = 0; i < n; i++)
     result[i] = vec[i];
-  for (unsigned i = numSym; i + 1 < vec.size(); i++)
+  for (unsigned i = n; i + 1 < vec.size(); i++)
     result[i + shift] = vec[i];
   result.back() = vec.back();
-  return result;
-}
-
-// Intersects two relations over the same dim/symbol variables but possibly
-// different local variables. The local variables of the two relations are
-// independent existentials, so the result has those of `a` followed by those
-// of `b`, with the columns of `b`'s rows shifted accordingly.
-IntegerRelation intersectRelations(const IntegerRelation &a,
-                                   const IntegerRelation &b) {
-  unsigned numSym = a.getNumDimAndSymbolVars();
-  assert(numSym == b.getNumDimAndSymbolVars() && "dim/symbol vars must match");
-  unsigned numLocalsA = a.getNumLocalVars(), numLocalsB = b.getNumLocalVars();
-  IntegerRelation result = a;
-  result.appendVar(VarKind::Local, numLocalsB);
-
-  const auto appendRows = [&](bool isEq) {
-    unsigned numRows = isEq ? b.getNumEqualities() : b.getNumInequalities();
-    for (unsigned i = 0; i < numRows; i++) {
-      auto row = isEq ? b.getEquality(i) : b.getInequality(i);
-      IntVector newRow(numSym + numLocalsA + numLocalsB + 1);
-      for (unsigned j = 0; j < numSym; j++)
-        newRow[j] = row[j];
-      for (unsigned j = 0; j < numLocalsB; j++)
-        newRow[numSym + numLocalsA + j] = row[numSym + j];
-      newRow.back() = row.back();
-      if (isEq)
-        result.addEquality(newRow);
-      else
-        result.addInequality(newRow);
-    }
-  };
-  appendRows(true);
-  appendRows(false);
   return result;
 }
 
 // Merges the local variable definitions of two intersected relations,
 // shifting the local columns referenced by `b`'s definitions to match.
 SmallVector<LocalDef> mergeLocalDefs(SmallVector<LocalDef> a,
-                                     SmallVector<LocalDef> b,
+                                     const SmallVector<LocalDef> &b,
                                      unsigned numSymbols) {
   unsigned numLocalsA = a.size();
-  for (LocalDef &def : b)
-    a.push_back({shiftLocalColumns(def.nom, numSymbols, numLocalsA),
-                 std::move(def.den)});
+  for (const LocalDef &def : b)
+    a.push_back({shift(def.nom, numSymbols, numLocalsA), def.den});
   return a;
 }
 
@@ -347,8 +311,8 @@ LogicalResult populateConstraint(AffineExpr expr, unsigned numSymbols,
     return failure();
 
   IntVector result = *maybeSum;
-  // We must guarantee that the result does not overflow.
-  // That is, min <= result <= max.
+  // We must guarantee that the result does not overflow:
+  //   min <= result <= max.
   auto [min, max] = getSignedBounds(type);
   // IntegerRelations expect constraints of form `row >= 0`.
   // First add a row for `result - min >= 0`.
@@ -415,13 +379,10 @@ Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc,
         return false;
     return true;
   };
-  // The rows pinning each local variable to its definition: the local holds
-  // `dividend floordiv divisor` by construction, so these rows always hold
-  // for the materialized values and need not be checked at runtime.
+  // Check whether `row` is defining one of the LocalDefs.
   const auto isDefiningRow = [&](ArrayRef<DynamicAPInt> row) {
     for (unsigned i = 0; i < numLocals; i++) {
       const LocalDef &def = localDefs[i];
-      // dividend - divisor * q_i >= 0.
       IntVector lower(numSymbols + numLocals + 1);
       for (unsigned j = 0; j + 1 < def.nom.size(); j++)
         lower[j] = def.nom[j];
@@ -441,9 +402,9 @@ Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc,
     return false;
   };
 
-  // Determine the local variables referenced by rows that will actually be
-  // checked, closing over the dividends of referenced locals. Only those
-  // need to be materialized.
+  // Determine the local variables that really needs to be checked.
+  // If a variable is only involved in its defining row, then we
+  // don't need to emit it.
   SmallVector<bool> needed(numLocals, false);
   for (unsigned i = 0, e = rel.getNumInequalities(); i < e; i++) {
     auto row = rel.getInequality(i);
@@ -453,13 +414,15 @@ Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc,
       if (row[numSymbols + k] != 0)
         needed[k] = true;
   }
+  // A local variable might be involved in nominator of locals after it.
+  // In this case it is also needed.
   for (unsigned i = numLocals; i > 0; i--)
     if (needed[i - 1])
       for (unsigned k = 0; k < i - 1; k++)
         if (localDefs[i - 1].nom[numSymbols + k] != 0)
           needed[k] = true;
 
-  // The minimum and maximum of `coeffs . values + constant` given the bounds.
+  // The minimum and maximum of `coeffs * values + constant` given the bounds.
   const auto rangeOf = [&](ArrayRef<DynamicAPInt> coeffs,
                            const DynamicAPInt &constant) {
     DynamicAPInt min(constant), max(constant);
@@ -469,7 +432,7 @@ Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc,
     }
     return std::pair{min, max};
   };
-  // The bit width needed to represent `coeffs . values + constant`.
+  // The bit width needed to represent `coeffs * values + constant`.
   const auto widthFor = [&](ArrayRef<DynamicAPInt> coeffs,
                             const DynamicAPInt &min, const DynamicAPInt &max) {
     int bitWidth = 1 + std::max(log2(min), log2(max));
@@ -480,7 +443,7 @@ Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc,
             1 + (int)cast<IntegerType>(values[j].getType()).getWidth());
     return bitWidth;
   };
-  // Emits `coeffs . values + constant` in `intType`.
+  // Emits `coeffs * values + constant` in `intType`.
   const auto emitLinearForm = [&](ArrayRef<DynamicAPInt> coeffs,
                                   const DynamicAPInt &constant, Type intType) {
     Value v =
@@ -497,8 +460,8 @@ Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc,
     return v;
   };
 
-  // Materialize each needed local variable as `dividend floordiv divisor`,
-  // where the dividend is over the symbols and the locals defined before it.
+  // Materialize each needed local variable as `nom / den`,
+  // where the nom is over the symbols and the locals defined before it.
   for (unsigned i = 0; i < numLocals; i++) {
     if (!needed[i]) {
       values.push_back(Value());
@@ -605,14 +568,13 @@ ArithToAffinePass::constructAffineMap(Value value, const DimIndex &dimIndex) {
             .Case<LLVM::MulOp>([&](LLVM::MulOp) { return l->expr * r->expr; })
             .DefaultUnreachable("constructAffineMap: should be exhaustive!");
 
-    auto constraint = intersectRelations(l->constraint, r->constraint);
-    auto localDefs = mergeLocalDefs(std::move(l->locals),
-                                    std::move(r->locals), numSymbols);
+    auto constraint = l->constraint.intersect(r->constraint);
+    auto locals = mergeLocalDefs(std::move(l->locals), r->locals, numSymbols);
     if (failed(populateConstraint(expr, numSymbols, def->getResult(0).getType(),
-                                  constraint, localDefs)))
+                                  constraint, locals)))
       return std::nullopt;
 
-    return AffineResult{expr, std::move(constraint), std::move(localDefs)};
+    return AffineResult{expr, constraint, std::move(locals)};
   }
 
   if (isa<arith::ExtSIOp>(def)) {
@@ -635,7 +597,7 @@ ArithToAffinePass::constructAffineMap(Value value, const DimIndex &dimIndex) {
       return std::nullopt;
     int64_t mod = pow<int64_t>(2, width);
     return AffineResult{maybeResult->expr % mod,
-                        std::move(maybeResult->constraint),
+                        maybeResult->constraint,
                         std::move(maybeResult->locals)};
   }
 
@@ -644,7 +606,7 @@ ArithToAffinePass::constructAffineMap(Value value, const DimIndex &dimIndex) {
     Type elementType = gep.getElemType();
     AffineExpr expr = getAffineConstantExpr(0, ctx);
     IntegerRelation constraint(space);
-    SmallVector<LocalDef> localDefs;
+    SmallVector<LocalDef> locals;
     // We constraint on the sum only.
     DataLayout layout(cast<ModuleOp>(getOperation()));
     for (auto index : indices) {
@@ -654,9 +616,8 @@ ArithToAffinePass::constructAffineMap(Value value, const DimIndex &dimIndex) {
           return std::nullopt;
 
         expr = expr + maybe->expr * layout.getTypeSize(elementType);
-        constraint = intersectRelations(constraint, maybe->constraint);
-        localDefs = mergeLocalDefs(std::move(localDefs),
-                                   std::move(maybe->locals), numSymbols);
+        constraint = constraint.intersect(maybe->constraint);
+        locals = mergeLocalDefs(std::move(locals), maybe->locals, numSymbols);
 
         if (isa<LLVM::LLVMStructType>(elementType))
           return std::nullopt;
@@ -666,13 +627,13 @@ ArithToAffinePass::constructAffineMap(Value value, const DimIndex &dimIndex) {
                 .Default([](Type t) { return t; });
         // Create the constraint suhc that the entire sum should not overflow.
         if (failed(populateConstraint(expr, numSymbols, v.getType(), constraint,
-                                      localDefs)))
+                                      locals)))
           return std::nullopt;
       }
       // TODO: IntegerAttr case
     }
     // GEP always treats its offsets as signed.
-    return AffineResult{expr, std::move(constraint), std::move(localDefs)};
+    return AffineResult{expr, constraint, std::move(locals)};
   }
   return std::nullopt;
 }
@@ -735,8 +696,8 @@ ArithToAffinePass::tidyResult(const AffineResult &result, ValueRange operands) {
   removeColumn(false);
 
   // Remap the dividends of the local variable definitions likewise.
-  SmallVector<LocalDef> localDefs;
-  localDefs.reserve(result.locals.size());
+  SmallVector<LocalDef> locals;
+  locals.reserve(result.locals.size());
   for (const LocalDef &def : result.locals) {
     IntVector dividend(numLeft + (def.nom.size() - numOperands));
     for (auto [before, after] : indexMap)
@@ -744,7 +705,7 @@ ArithToAffinePass::tidyResult(const AffineResult &result, ValueRange operands) {
     for (unsigned k = numOperands; k + 1 < def.nom.size(); k++)
       dividend[numLeft + (k - numOperands)] = def.nom[k];
     dividend.back() = def.nom.back();
-    localDefs.push_back({std::move(dividend), def.den});
+    locals.push_back({std::move(dividend), def.den});
   }
 
   OpBuilder builder(ctx);
@@ -788,9 +749,15 @@ ArithToAffinePass::tidyResult(const AffineResult &result, ValueRange operands) {
   // involving locals are then only removable when implied by the remaining
   // rows, which keeps the synthesized check sound.
   reference.appendVar(VarKind::Local, numLocals);
+  llvm::errs() << "constraint:\n";
+  constraint.dump();
+  llvm::errs() << "\nreference:\n";
+  reference.dump();
   constraint.removeRedundantConstraintsWhen(reference);
+  llvm::errs() << "constraint simplified:\n";
+  constraint.dump();
 
-  return AffineMapResult{symbols, expr, constraint, std::move(localDefs)};
+  return AffineMapResult{symbols, expr, constraint, std::move(locals)};
 }
 
 // Adds `min <= var[pos] <= max` rows to `rel`.
@@ -823,7 +790,7 @@ void ArithToAffinePass::addAnalyzedRangeConstraints(
 // Returns the operation that a ValueBoundsOpInterface query for `value`
 // should be directed to: the defining operation for an op result, or the
 // operation owning the region for a block argument.
-static Operation *getOwnerOfValue(Value value) {
+Operation *getOwner(Value value) {
   if (auto arg = dyn_cast<BlockArgument>(value)) {
     Region *region = arg.getOwner()->getParent();
     return region ? region->getParentOp() : nullptr;
@@ -839,7 +806,7 @@ void ArithToAffinePass::addValueBoundsConstraints(
   // scf.for loop for its induction variable).
   if (!value.getType().isIntOrIndex())
     return;
-  Operation *owner = getOwnerOfValue(value);
+  Operation *owner = getOwner(value);
   if (!owner || !isa<ValueBoundsOpInterface>(owner))
     return;
 
@@ -857,7 +824,7 @@ void ArithToAffinePass::addValueBoundsConstraints(
       return false;
     if (valueToSymbol.contains(v))
       return true;
-    Operation *owner = getOwnerOfValue(v);
+    Operation *owner = getOwner(v);
     return !owner || !isa<ValueBoundsOpInterface>(owner);
   };
 
@@ -925,8 +892,8 @@ void ArithToAffinePass::addValueBoundsConstraints(
       columns[k] = it->second;
     }
 
-    // Lower bound: `value >= bound`, i.e. `symbol - bound >= 0`.
-    // Upper bound (closed): `value <= bound`, i.e. `bound - symbol >= 0`.
+    // Lower bound: `symbol - bound >= 0`.
+    // Upper bound: `bound - symbol >= 0`.
     DynamicAPInt sign(type == BoundType::LB ? 1 : -1);
     SmallVector<DynamicAPInt> row(fragment.getNumVars() + 1);
     row[pos] = sign;
