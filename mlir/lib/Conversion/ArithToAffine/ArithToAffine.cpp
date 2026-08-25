@@ -308,6 +308,23 @@ SmallVector<LocalDef> mergeLocalDefs(SmallVector<LocalDef> a,
   return a;
 }
 
+// Returns whether `row` is a positive multiple of `pattern`, i.e., whether
+// the two are logically equivalent as `>= 0` constraints.
+static bool isPositiveMultiple(ArrayRef<DynamicAPInt> row,
+                               ArrayRef<DynamicAPInt> pattern) {
+  unsigned pivot = 0;
+  while (pivot < pattern.size() && pattern[pivot] == 0)
+    pivot++;
+  if (pivot == pattern.size())
+    return false;
+  if (row[pivot] * pattern[pivot] <= 0)
+    return false;
+  for (unsigned j = 0; j < pattern.size(); j++)
+    if (row[j] * pattern[pivot] != pattern[j] * row[pivot])
+      return false;
+  return true;
+}
+
 LogicalResult populateConstraint(AffineExpr expr, unsigned numSymbols,
                                  Type type, IntegerRelation &constraint,
                                  SmallVectorImpl<LocalDef> &localDefs) {
@@ -331,7 +348,12 @@ LogicalResult populateConstraint(AffineExpr expr, unsigned numSymbols,
     e *= -1;
   result.back() += max;
   constraint.addInequality(result);
-  constraint.simplify();
+  // `simplify()` may drop rows that are rationally implied by the others,
+  // including the defining rows of local variables. Restore them: they hold
+  // by construction, and they are needed for the local variables to be
+  // recognized as divisions (e.g. when merging relations with duplicate
+  // divisions).
+  // Therefore, we cannot call simplify() here.
   return success();
 }
 
@@ -382,6 +404,18 @@ int log2(DynamicAPInt x) {
   return v;
 }
 
+// Returns the exponent `e` such that `x == 2^e` when `x` is a positive power
+// of two, and nullopt otherwise.
+std::optional<int> exponentOfPowerOfTwo(const DynamicAPInt &x) {
+  if (x < 1)
+    return std::nullopt;
+  DynamicAPInt v(x);
+  int e = 0;
+  while (v % 2 == 0)
+    v /= 2, e++;
+  return v == 1 ? std::optional<int>(e) : std::nullopt;
+}
+
 Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc,
                                          const IntegerRelation &rel,
                                          ValueRange inOperands,
@@ -407,22 +441,6 @@ Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc,
   unsigned numSymbols = values.size();
   unsigned numLocals = localDefs.size();
 
-  // Returns whether `row` is a positive multiple of `pattern`, i.e., whether
-  // the two are logically equivalent as `>= 0` constraints.
-  const auto isPositiveMultiple = [](ArrayRef<DynamicAPInt> row,
-                                     ArrayRef<DynamicAPInt> pattern) {
-    unsigned pivot = 0;
-    while (pivot < pattern.size() && pattern[pivot] == 0)
-      pivot++;
-    if (pivot == pattern.size())
-      return false;
-    if (row[pivot] * pattern[pivot] <= 0)
-      return false;
-    for (unsigned j = 0; j < pattern.size(); j++)
-      if (row[j] * pattern[pivot] != pattern[j] * row[pivot])
-        return false;
-    return true;
-  };
   // Check whether `row` is defining one of the LocalDefs.
   const auto isDefiningRow = [&](ArrayRef<DynamicAPInt> row) {
     for (unsigned i = 0; i < numLocals; i++) {
@@ -521,17 +539,26 @@ Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc,
     Type intType = IntegerType::get(builder.getContext(), bitWidth);
     Value v =
         emitLinearForm(dividend.drop_back(), def.nom.back(), intType);
-    auto divisor = arith::ConstantIntOp::create(builder, loc, intType,
-                                                (int64_t)def.den);
-    auto zero = arith::ConstantIntOp::create(builder, loc, intType, 0);
-    auto one = arith::ConstantIntOp::create(builder, loc, intType, 1);
-    // divsi/remsi truncate towards zero; correct to floor division.
-    Value q = arith::DivSIOp::create(builder, loc, v, divisor);
-    Value r = arith::RemSIOp::create(builder, loc, v, divisor);
-    Value negRem =
-        arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::slt, r, zero);
-    q = arith::SelectOp::create(builder, loc, negRem,
-                                arith::SubIOp::create(builder, loc, q, one), q);
+    // An arithmetic right shift implements floor division exactly when the
+    // divisor is a power of two. Otherwise, divsi/remsi truncate towards
+    // zero and must be corrected to floor division.
+    Value q;
+    if (std::optional<int> exponent = exponentOfPowerOfTwo(def.den)) {
+      auto shift =
+          arith::ConstantIntOp::create(builder, loc, intType, *exponent);
+      q = arith::ShRSIOp::create(builder, loc, v, shift);
+    } else {
+      auto divisor =
+          arith::ConstantIntOp::create(builder, loc, intType, (int64_t)def.den);
+      auto zero = arith::ConstantIntOp::create(builder, loc, intType, 0);
+      auto one = arith::ConstantIntOp::create(builder, loc, intType, 1);
+      q = arith::DivSIOp::create(builder, loc, v, divisor);
+      Value r = arith::RemSIOp::create(builder, loc, v, divisor);
+      Value negRem = arith::CmpIOp::create(builder, loc,
+                                           arith::CmpIPredicate::slt, r, zero);
+      q = arith::SelectOp::create(
+          builder, loc, negRem, arith::SubIOp::create(builder, loc, q, one), q);
+    }
     values.push_back(q);
     bounds.push_back({floordiv(min, def.den),
                       floordiv(max, def.den)});

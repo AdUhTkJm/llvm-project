@@ -1,13 +1,14 @@
 // RUN: mlir-opt -convert-arith-to-affine %s | FileCheck %s
 
-// The sum of two zero extensions is represented with two modulo locals. The
-// upper-bound check of the GEP sum is not implied by the defining rows of
-// the locals, so the locals are materialized at runtime as floor divisions.
-// Since the divisors are powers of two, an arithmetic right shift implements
-// them exactly without any truncation correction, and the check
-// (ri + rj <= 1073741823, i.e. 4*(ri + rj) <= 2^32 - 1 after GCD tightening)
-// is evaluated with them. The defining rows of the locals themselves hold by
-// construction and are not checked.
+// Same as extui-sum.mlir, but the addition carries the `nuw` flag. The known
+// fact 0 <= u(a) + u(b) < 2^33 (with u(x) = x mod 2^33) lets the reference
+// relation eliminate every constraint row of the addition itself, including
+// its local variable definitions. It does not imply the bound on the GEP
+// offset, 4 * ((i mod 2^32) + (j mod 2^32)) <= 2^32 - 1 under the signed
+// interpretation of i33, so the modulo locals are still materialized and
+// this last check remains:
+// -2147483648 <= (i mod 2^32) + (j mod 2^32) <= 1073741823,
+// i.e. 4*((i mod 2^32) + (j mod 2^32)) <= 2^32 - 1 after GCD tightening.
 
 // CHECK:       #map = affine_map<()[s0, s1] -> ((s0 mod 4294967296 + s1 mod 4294967296) * 4)>
 // CHECK-LABEL: llvm.func @load_extui_sum(
@@ -32,7 +33,7 @@ module {
     %base = llvm.alloca %one x i32 : (i32) -> !llvm.ptr
     %a = arith.extui %i : i32 to i33
     %b = arith.extui %j : i32 to i33
-    %sum = arith.addi %a, %b : i33
+    %sum = arith.addi %a, %b overflow<nuw> : i33
     %addr = llvm.getelementptr %base[%sum] : (!llvm.ptr, i33) -> !llvm.ptr, i32
     %v = llvm.load %addr : !llvm.ptr -> i32
     llvm.return %v : i32
