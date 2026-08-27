@@ -143,6 +143,14 @@ def ConvertArithToAffine : Pass<"convert-arith-to-affine"> {
   let summary = "Convert Arith dialect to affine dialect";
   let dependentDialects = ["affine::AffineDialect", "LLVM::LLVMDialect",
                            "scf::SCFDialect"];
+  let options = [
+    Option<"speculateNoModulus", "speculate-no-modulus", "bool",
+           /*default=*/"false",
+           "Speculate that no modulus is involved in zero extensions: "
+           "synthesize an additional branch checking that the operands of "
+           "`arith.extui` are non-negative, under which the emitted affine "
+           "maps involve no modulo">
+  ];
 }
 
 //===----------------------------------------------------------------------===//
