@@ -8,14 +8,16 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
-#include "mlir/Dialect/MemRef/IR/MemoryAccessOpInterfaces.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Interfaces/ValueBoundsOpInterface.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DynamicAPInt.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -31,6 +33,9 @@ using namespace mlir::presburger;
 namespace {
 
 using IntVector = SmallVector<llvm::DynamicAPInt>;
+
+// A lower/upper bound pair on the signed interpretation of a value.
+using Bound = std::pair<DynamicAPInt, DynamicAPInt>;
 
 // The definition of a local variable introduced for a division
 // or modulus. The variable represents `nom / den`, where
@@ -99,9 +104,31 @@ struct ArithToAffinePass : impl::ConvertArithToAffineBase<ArithToAffinePass> {
   }
   // Computes the offset and represent it as an affine map for `value`.
   LiftResult lift(Value value);
+  // Synthesizes a runtime check for `rel` over `values` (the symbols), where
+  // `bounds` gives a sound signed range for each symbol value.
   Value synthesizeCheck(OpBuilder &builder, Location loc,
-                        const IntegerRelation &rel, ValueRange operands,
-                        ArrayRef<LocalDef> localDefs);
+                        const IntegerRelation &rel,
+                        ArrayRef<LocalDef> localDefs, ValueRange values,
+                        ArrayRef<Bound> bounds);
+  // Returns sound signed bounds for `value`: its analyzed integer range if
+  // available, otherwise the bounds of its type (64 bits for index).
+  Bound boundsOfValue(Value value) const;
+  // Lifts the address of `load` individually, guarding the lifted address
+  // with a per-load runtime check.
+  void liftLoadAddress(LLVM::LoadOp load);
+  // Intersects the lifting constraints of all loads directly inside `loop`
+  // and emits a single check before it:
+  //   if (check) { lifted loop } else { original loop }
+  // Falls back to per-load lifting when the constraints cannot be hoisted.
+  void liftLoop(Operation *loop);
+  // Computes a bound of `inner` (a symbol defined inside `loop`) in terms of
+  // values defined outside `loop`, expressed as coefficients over the
+  // hoisted symbols. Bound operands defined outside the loop are registered
+  // in `hoistedOperands`/`hoistedIndex` on demand.
+  std::optional<IntVector>
+  computeOuterBound(Value inner, BoundType type, Operation *loop,
+                    SmallVectorImpl<Value> &hoistedOperands,
+                    DenseMap<Value, unsigned> &hoistedIndex);
   void runOnOperation() override;
 
 private:
@@ -279,6 +306,25 @@ std::pair<DynamicAPInt, DynamicAPInt> getSignedBounds(Type type) {
   return {-power, power - 1};
 }
 
+// The bit width of a value used in check arithmetic; index values are
+// treated as 64-bit.
+unsigned valueWidth(Value value) {
+  if (isa<IndexType>(value.getType()))
+    return 64;
+  return cast<IntegerType>(value.getType()).getWidth();
+}
+
+// Returns whether `value` is defined inside `loop`, including block
+// arguments of the regions of `loop`.
+bool valueInLoop(Value value, Operation *loop) {
+  if (auto arg = dyn_cast<BlockArgument>(value)) {
+    Operation *parent = arg.getOwner()->getParent()->getParentOp();
+    return parent == loop || loop->isAncestor(parent);
+  }
+  Operation *def = value.getDefiningOp();
+  return def && loop->isAncestor(def);
+}
+
 // Normal division truncates towards zero.
 // For floor division, we must subtract 1 when x < 0.
 DynamicAPInt floordiv(const DynamicAPInt &x, const DynamicAPInt &y) {
@@ -395,6 +441,24 @@ void addKnownBounds(AffineExpr expr, unsigned numSymbols,
   rel.addInequality(result);
 }
 
+// Adds the constraint `expr >= 0` to `constraint`, introducing local
+// variables for divisions/moduli as needed. The local variables are replayed
+// into `reference` as well, so that the two relations remain in the same
+// space.
+//
+// Silently fails if `expr` is not representible in an integer relation.
+LogicalResult addNonNegativeConstraint(AffineExpr expr, unsigned numSymbols,
+                                       IntegerRelation &constraint,
+                                       IntegerRelation &reference,
+                                       SmallVectorImpl<LocalDef> &localDefs) {
+  auto coeffs = extractCoefficients(expr, numSymbols, &constraint, &localDefs);
+  if (!coeffs)
+    return failure();
+  syncLocalDefs(reference, localDefs);
+  constraint.addInequality(*coeffs);
+  return success();
+}
+
 int log2(DynamicAPInt x) {
   int v = 0;
   while (x != 0) {
@@ -406,7 +470,7 @@ int log2(DynamicAPInt x) {
 
 // Returns the exponent `e` such that `x == 2^e` when `x` is a positive power
 // of two, and nullopt otherwise.
-std::optional<int> exponentOfPowerOfTwo(const DynamicAPInt &x) {
+std::optional<int> exactLog2(const DynamicAPInt &x) {
   if (x < 1)
     return std::nullopt;
   DynamicAPInt v(x);
@@ -418,25 +482,23 @@ std::optional<int> exponentOfPowerOfTwo(const DynamicAPInt &x) {
 
 Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc,
                                          const IntegerRelation &rel,
-                                         ValueRange inOperands,
-                                         ArrayRef<LocalDef> localDefs) {
-  // Compute the minimum and maximum for the operands.
-  using Bound = std::pair</*min*/ DynamicAPInt, /*max*/ DynamicAPInt>;
-  SmallVector<Bound> bounds;
-  // The values of the columns of `rel`: the symbols followed by the local
-  // variables materialized from their definitions.
-  SmallVector<Value> values;
-
-  bounds.reserve(inOperands.size());
-  values.reserve(inOperands.size());
-  for (auto operand : inOperands) {
-    auto cast = llvm::cast<arith::IndexCastOp>(operand.getDefiningOp());
-    auto type = cast.getIn().getType();
-    bounds.push_back(getSignedBounds(type));
-    values.push_back(cast.getIn());
-  }
+                                         ArrayRef<LocalDef> localDefs,
+                                         ValueRange inValues,
+                                         ArrayRef<Bound> inBounds) {
+  assert(inValues.size() == inBounds.size() &&
+         "check values and bounds out of sync");
   assert(rel.getNumLocalVars() == localDefs.size() &&
          "local variable definitions out of sync with constraint");
+
+  llvm::errs() << "synthesizing:\n";
+  rel.dump();
+
+  // The values of the columns of `rel`: the symbols followed by the local
+  // variables materialized from their definitions.
+  SmallVector<Value> values(inValues.begin(), inValues.end());
+  SmallVector<Bound> bounds(inBounds.begin(), inBounds.end());
+  values.reserve(inValues.size() + localDefs.size());
+  bounds.reserve(inValues.size() + localDefs.size());
 
   unsigned numSymbols = values.size();
   unsigned numLocals = localDefs.size();
@@ -500,22 +562,27 @@ Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc,
     int bitWidth = 1 + std::max(log2(min), log2(max));
     for (unsigned j = 0; j < coeffs.size(); j++)
       if (coeffs[j] != 0)
-        bitWidth = std::max(
-            bitWidth,
-            1 + (int)cast<IntegerType>(values[j].getType()).getWidth());
+        bitWidth = std::max(bitWidth, 1 + (int)valueWidth(values[j]));
     return bitWidth;
   };
   // Emits `coeffs * values + constant` in `intType`.
   const auto emitLinearForm = [&](ArrayRef<DynamicAPInt> coeffs,
                                   const DynamicAPInt &constant, Type intType) {
-    Value v =
-        arith::ConstantIntOp::create(builder, loc, intType, (int64_t)constant);
+    unsigned bitWidth = intType.getIntOrFloatBitWidth();
+    Value v = arith::ConstantIntOp::create(
+        builder, loc, intType,
+        llvm::APInt(bitWidth, (int64_t)constant, /*isSigned=*/true));
     for (unsigned j = 0; j < coeffs.size(); j++) {
       if (coeffs[j] == 0)
         continue;
-      auto cst = arith::ConstantIntOp::create(builder, loc, intType,
-                                              (int64_t)coeffs[j]);
-      auto ext = arith::ExtSIOp::create(builder, loc, intType, values[j]);
+      auto cst = arith::ConstantIntOp::create(
+          builder, loc, intType,
+          llvm::APInt(bitWidth, (int64_t)coeffs[j], /*isSigned=*/true));
+      Value ext;
+      if (isa<IndexType>(values[j].getType()))
+        ext = arith::IndexCastOp::create(builder, loc, intType, values[j]);
+      else
+        ext = arith::ExtSIOp::create(builder, loc, intType, values[j]);
       auto mul = arith::MulIOp::create(builder, loc, ext, cst);
       v = arith::AddIOp::create(builder, loc, v, mul);
     }
@@ -531,29 +598,28 @@ Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc,
       continue;
     }
     const LocalDef &def = localDefs[i];
-    ArrayRef<DynamicAPInt> dividend(def.nom);
-    auto [min, max] = rangeOf(dividend.drop_back(), def.nom.back());
+    ArrayRef<DynamicAPInt> nom(def.nom);
+    auto [min, max] = rangeOf(nom.drop_back(), def.nom.back());
     // The type must additionally hold the (positive) divisor itself.
-    int bitWidth = std::max(widthFor(dividend.drop_back(), min, max),
-                            log2(def.den) + 2);
+    int bitWidth =
+        std::max(widthFor(nom.drop_back(), min, max), log2(def.den) + 2);
     Type intType = IntegerType::get(builder.getContext(), bitWidth);
-    Value v =
-        emitLinearForm(dividend.drop_back(), def.nom.back(), intType);
+    Value v = emitLinearForm(nom.drop_back(), def.nom.back(), intType);
     // An arithmetic right shift implements floor division exactly when the
     // divisor is a power of two. Otherwise, divsi/remsi truncate towards
     // zero and must be corrected to floor division.
     Value q;
-    if (std::optional<int> exponent = exponentOfPowerOfTwo(def.den)) {
+    if (std::optional<int> exponent = exactLog2(def.den)) {
       auto shift =
           arith::ConstantIntOp::create(builder, loc, intType, *exponent);
       q = arith::ShRSIOp::create(builder, loc, v, shift);
     } else {
-      auto divisor =
+      auto den =
           arith::ConstantIntOp::create(builder, loc, intType, (int64_t)def.den);
       auto zero = arith::ConstantIntOp::create(builder, loc, intType, 0);
       auto one = arith::ConstantIntOp::create(builder, loc, intType, 1);
-      q = arith::DivSIOp::create(builder, loc, v, divisor);
-      Value r = arith::RemSIOp::create(builder, loc, v, divisor);
+      q = arith::DivSIOp::create(builder, loc, v, den);
+      Value r = arith::RemSIOp::create(builder, loc, v, den);
       Value negRem = arith::CmpIOp::create(builder, loc,
                                            arith::CmpIPredicate::slt, r, zero);
       q = arith::SelectOp::create(
@@ -691,20 +757,32 @@ ArithToAffinePass::constructAffineMap(Value value, const DimIndex &dimIndex) {
     return AffineResult{expr, constraint, reference, std::move(locals)};
   }
 
-  if (isa<arith::ExtSIOp>(def)) {
+  if (isa<arith::ExtSIOp>(def) || isa<arith::IndexCastOp>(def)) {
     // This never imposes any extra constraint, since we chose our internal
     // representation as signed.
     return constructAffineMap(def->getOperand(0), dimIndex);
   }
 
   if (auto ext = dyn_cast<arith::ExtUIOp>(def)) {
-    // We require a modulo. If the extension goes from `m` to `n` bit, then
-    // we must modulo by 2^m.
     auto operand = ext.getIn();
     auto maybeResult = constructAffineMap(operand, dimIndex);
     if (!maybeResult)
       return std::nullopt;
 
+    // Under speculation, we require the operand to be non-negative instead of
+    // introducing a modulo: the signed and unsigned interpretations of a
+    // non-negative value coincide, so the zero extension does not change the
+    // value.
+    if (speculateNoModulus) {
+      if (failed(addNonNegativeConstraint(
+              maybeResult->expr, numSymbols, maybeResult->constraint,
+              maybeResult->reference, maybeResult->locals)))
+        return std::nullopt;
+      return maybeResult;
+    }
+
+    // Otherwise, we require a modulo. If the extension goes from `m` to `n`
+    // bit, then we must modulo by 2^m.
     unsigned width = operand.getType().getIntOrFloatBitWidth();
     // The modulus 2^m must fit in an int64_t.
     if (width >= 63)
@@ -872,13 +950,7 @@ ArithToAffinePass::tidyResult(const AffineResult &result, ValueRange operands) {
   // involving locals are then only removable when implied by the remaining
   // rows, which keeps the synthesized check sound.
   reference = reference.intersect(wrapFlags);
-  llvm::errs() << "constraint:\n";
-  constraint.dump();
-  llvm::errs() << "\nreference:\n";
-  reference.dump();
   constraint.removeRedundantConstraintsWhen(reference);
-  llvm::errs() << "constraint simplified:\n";
-  constraint.dump();
 
   return AffineMapResult{symbols, expr, constraint, std::move(locals)};
 }
@@ -1080,11 +1152,35 @@ ArithToAffinePass::LiftResult ArithToAffinePass::lift(Value value) {
       AffineMap::get(0, liftResult->operands.size(), liftResult->expr);
   Value apply = affine::AffineApplyOp::create(
       builder, loc, builder.getIndexType(), affineMap, liftResult->operands);
+  SmallVector<Value> checkValues;
+  SmallVector<Bound> checkBounds;
+  for (Value operand : liftResult->operands) {
+    if (auto cast = operand.getDefiningOp<arith::IndexCastOp>()) {
+      checkValues.push_back(cast.getIn());
+      checkBounds.push_back(getSignedBounds(cast.getIn().getType()));
+    } else {
+      checkValues.push_back(operand);
+      checkBounds.push_back(boundsOfValue(operand));
+    }
+  }
   Value condition =
-      synthesizeCheck(builder, loc, liftResult->constraint,
-                      liftResult->operands, liftResult->locals);
+      synthesizeCheck(builder, loc, liftResult->constraint, liftResult->locals,
+                      checkValues, checkBounds);
 
   return {apply, condition};
+}
+
+Bound ArithToAffinePass::boundsOfValue(Value value) const {
+  if (auto *lattice =
+          solver->lookupState<dataflow::IntegerValueRangeLattice>(value);
+      lattice && !lattice->getValue().isUninitialized()) {
+    const ConstantIntRanges &range = lattice->getValue().getValue();
+    return {DynamicAPInt(range.smin()), DynamicAPInt(range.smax())};
+  }
+  if (value.getType().isInteger())
+    return getSignedBounds(value.getType());
+  auto power = pow(DynamicAPInt(2), 63);
+  return {-power, power - 1};
 }
 
 Value findGEPBase(Value addr) {
@@ -1095,6 +1191,421 @@ Value findGEPBase(Value addr) {
     return findGEPBase(gep.getBase());
 
   return addr;
+}
+
+std::optional<IntVector>
+ArithToAffinePass::computeOuterBound(Value inner, BoundType boundType,
+                                     Operation *loop,
+                                     SmallVectorImpl<Value> &hoistedOperands,
+                                     DenseMap<Value, unsigned> &hoistedIndex) {
+  if (!inner.getType().isIntOrIndex())
+    return std::nullopt;
+  Operation *owner = getOwner(inner);
+  if (!owner || !isa<ValueBoundsOpInterface>(owner))
+    return std::nullopt;
+
+  MLIRContext *ctx = inner.getContext();
+  ValueBoundsOptions options;
+  options.allowIntegerType = true;
+
+  // Stop the backward traversal at values defined outside the loop: the
+  // bound must be expressed in terms of those so that it is available before
+  // the loop. Also stop at values that cannot be analyzed further.
+  auto stopCondition = [&](Value v, std::optional<int64_t> dim,
+                           ValueBoundsConstraintSet &) {
+    if (v == inner)
+      return false;
+    if (!valueInLoop(v, loop))
+      return true;
+    Operation *owner = getOwner(v);
+    return !owner || !isa<ValueBoundsOpInterface>(owner);
+  };
+
+  AffineMap boundMap;
+  ValueDimList mapOperands;
+  if (failed(ValueBoundsConstraintSet::computeBound(
+          boundMap, mapOperands, boundType,
+          ValueBoundsConstraintSet::Variable(inner), stopCondition, options)))
+    return std::nullopt;
+
+  // Convert the dimensions of the map to symbols: both dimensions and
+  // symbols correspond to entries of `mapOperands`.
+  unsigned numMapOperands = boundMap.getNumDims() + boundMap.getNumSymbols();
+  SmallVector<AffineExpr> dimReplacements, symReplacements;
+  for (unsigned i = 0; i < boundMap.getNumDims(); i++)
+    dimReplacements.push_back(getAffineSymbolExpr(i, ctx));
+  for (unsigned i = 0; i < boundMap.getNumSymbols(); i++)
+    symReplacements.push_back(
+        getAffineSymbolExpr(boundMap.getNumDims() + i, ctx));
+  AffineExpr boundExpr = boundMap.getResult(0).replaceDimsAndSymbols(
+      dimReplacements, symReplacements);
+
+  // The bound is not necessarily affine (e.g. it may contain a floordiv with
+  // a non-constant divisor); reject such bounds.
+  std::optional<IntVector> maybeCoeffs =
+      extractCoefficients(boundExpr, numMapOperands);
+  if (!maybeCoeffs)
+    return std::nullopt;
+
+  // Register the bound operands as hoisted symbols. They must all be defined
+  // outside the loop for the bound to be available there.
+  SmallVector<std::pair<unsigned, DynamicAPInt>> terms;
+  for (unsigned k = 0; k < numMapOperands; k++) {
+    if ((*maybeCoeffs)[k] == 0)
+      continue;
+    if (mapOperands[k].second)
+      return std::nullopt;
+    Value atom = mapOperands[k].first;
+    if (valueInLoop(atom, loop))
+      return std::nullopt;
+    auto [it, inserted] =
+        hoistedIndex.try_emplace(atom, hoistedOperands.size());
+    if (inserted)
+      hoistedOperands.push_back(atom);
+    terms.push_back({it->second, (*maybeCoeffs)[k]});
+  }
+
+  IntVector result(hoistedOperands.size() + 1);
+  for (auto [index, coeff] : terms)
+    result[index] += coeff;
+  result.back() = maybeCoeffs->back();
+  return result;
+}
+
+void ArithToAffinePass::liftLoadAddress(LLVM::LoadOp load) {
+  OpBuilder builder(load);
+  Value addr = load.getAddr();
+  Location loc = load.getLoc();
+  LiftResult result = lift(addr);
+  if (!result.apply)
+    return;
+  auto branch = scf::IfOp::create(
+      builder, loc, result.condition,
+      [&](OpBuilder &builder, Location loc) {
+        Value gepBase = findGEPBase(addr);
+        auto cast = arith::IndexCastOp::create(
+            builder, loc, builder.getI64Type(), result.apply);
+        auto gep = LLVM::GEPOp::create(builder, loc, addr.getType(),
+                                       builder.getI8Type(), gepBase, {cast});
+        scf::YieldOp::create(builder, loc, gep.getResult());
+      },
+      [&](OpBuilder &builder, Location loc) {
+        scf::YieldOp::create(builder, loc, addr);
+      });
+  load.setOperand(branch.getResult(0));
+}
+
+void ArithToAffinePass::liftLoop(Operation *loop) {
+  // Collect the loads directly inside `loop`; loads of nested loops are
+  // handled when those loops are processed.
+  SmallVector<LLVM::LoadOp> loads;
+  loop->walk([&](LLVM::LoadOp load) {
+    if (load->getParentOfType<LoopLikeOpInterface>().getOperation() == loop)
+      loads.push_back(load);
+  });
+  if (loads.empty())
+    return;
+
+  const auto fallback = [&]() {
+    for (auto load : loads)
+      liftLoadAddress(load);
+  };
+
+  // Union of the leaf operands of all the load address expressions.
+  SmallVector<Value> operands;
+  DenseSet<Value> seen;
+  for (auto load : loads) {
+    SmallVector<Value> leaves;
+    collectOperandsUpChain(load.getAddr(), leaves);
+    for (Value v : leaves)
+      if (seen.insert(v).second)
+        operands.push_back(v);
+  }
+  unsigned numSymbols = operands.size();
+
+  DimIndex dimIndex;
+  for (auto [i, v] : llvm::enumerate(operands))
+    dimIndex[v] = i;
+
+  // Symbols whose value is defined inside the loop (e.g. the induction
+  // variable) cannot be referenced by a check emitted before the loop.
+  SmallVector<bool> inner(numSymbols);
+  for (unsigned j = 0; j < numSymbols; j++)
+    inner[j] = valueInLoop(operands[j], loop);
+
+  // Symbol table of the hoisted check: the outer operands first, in order.
+  SmallVector<Value> hOperands;
+  DenseMap<Value, unsigned> hIndex;
+  SmallVector<unsigned> allToHoisted(numSymbols);
+  for (unsigned j = 0; j < numSymbols; j++) {
+    if (inner[j])
+      continue;
+    allToHoisted[j] = hOperands.size();
+    hIndex[operands[j]] = hOperands.size();
+    hOperands.push_back(operands[j]);
+  }
+
+  // Intersect the constraints of all the loads.
+  PresburgerSpace space = PresburgerSpace::getSetSpace(numSymbols);
+  IntegerRelation constraint(space);
+  IntegerRelation reference(space);
+  SmallVector<LocalDef> locals;
+  SmallVector<std::optional<AffineExpr>> exprs;
+  bool any = false;
+  for (auto load : loads) {
+    auto result = constructAffineMap(load.getAddr(), dimIndex);
+    if (!result) {
+      exprs.push_back(std::nullopt);
+      continue;
+    }
+    // Bring the local variables of `result` into the combined space.
+    unsigned offset = locals.size();
+    for (const LocalDef &def : result->locals) {
+      IntVector nom = shift(def.nom, numSymbols, offset);
+      constraint.addLocalFloorDiv(nom, def.den);
+      reference.addLocalFloorDiv(nom, def.den);
+      locals.push_back({nom, def.den});
+    }
+    constraint = constraint.intersect(result->constraint);
+    reference = reference.intersect(result->reference);
+    exprs.push_back(result->expr);
+    any = true;
+  }
+  if (!any)
+    return fallback();
+
+  // Record facts known about the symbols (analyzed ranges, value bounds) in
+  // a local-free relation, then merge them into `reference`.
+  IntegerRelation facts(PresburgerSpace::getSetSpace(numSymbols));
+  DenseMap<Value, unsigned> valueToSymbol;
+  for (unsigned j = 0; j < numSymbols; j++)
+    valueToSymbol[operands[j]] = j;
+  for (unsigned j = 0; j < numSymbols; j++) {
+    addAnalyzedRangeConstraints(operands[j], j, facts);
+    addValueBoundsConstraints(operands[j], j, valueToSymbol, facts);
+  }
+  unsigned numLocals = locals.size();
+  for (unsigned i = 0, e = facts.getNumInequalities(); i < e; i++) {
+    auto row = facts.getInequality(i);
+    IntVector padded(numSymbols + numLocals + 1);
+    for (unsigned j = 0; j < numSymbols; j++)
+      padded[j] = row[j];
+    padded.back() = row.back();
+    reference.addInequality(padded);
+  }
+  constraint.removeRedundantConstraintsWhen(reference);
+
+  // The definitions of local variables must be materializable before the
+  // loop, so they must not involve inner symbols.
+  for (const LocalDef &def : locals)
+    for (unsigned j = 0; j < numSymbols; j++)
+      if (inner[j] && def.nom[j] != 0)
+        return fallback();
+
+  // Determine the inner symbols the remaining constraints refer to, and
+  // compute their bounds in terms of the outer symbols.
+  SmallVector<bool> needed(numSymbols, false);
+  const auto scan = [&](bool isEq) {
+    unsigned numRows =
+        isEq ? constraint.getNumEqualities() : constraint.getNumInequalities();
+    for (unsigned i = 0; i < numRows; i++) {
+      auto row = isEq ? constraint.getEquality(i) : constraint.getInequality(i);
+      for (unsigned j = 0; j < numSymbols; j++)
+        if (inner[j] && row[j] != 0)
+          needed[j] = true;
+    }
+  };
+  scan(true);
+  scan(false);
+
+  SmallVector<std::optional<IntVector>> lower(numSymbols), upper(numSymbols);
+  for (unsigned j = 0; j < numSymbols; j++) {
+    if (!needed[j])
+      continue;
+    lower[j] =
+        computeOuterBound(operands[j], BoundType::LB, loop, hOperands, hIndex);
+    upper[j] =
+        computeOuterBound(operands[j], BoundType::UB, loop, hOperands, hIndex);
+    if (!lower[j] || !upper[j])
+      return fallback();
+  }
+
+  // Substitute the worst-case bound of every inner symbol into the
+  // constraints, yielding a relation over the outer symbols only.
+  unsigned numOuter = hOperands.size();
+  IntegerRelation hoisted(PresburgerSpace::getSetSpace(numOuter, 0, numLocals));
+  IntegerRelation hReference(PresburgerSpace::getSetSpace(numOuter));
+  for (unsigned j = 0; j < numOuter; j++)
+    addAnalyzedRangeConstraints(hOperands[j], j, hReference);
+  SmallVector<LocalDef> hLocals;
+  for (unsigned i = 0; i < numLocals; i++) {
+    const LocalDef &def = locals[i];
+    IntVector nom(numOuter + i + 1);
+    for (unsigned j = 0; j < numSymbols; j++)
+      if (!inner[j])
+        nom[allToHoisted[j]] = def.nom[j];
+    for (unsigned k = 0; k < i; k++)
+      nom[numOuter + k] = def.nom[numSymbols + k];
+    nom.back() = def.nom.back();
+    hLocals.push_back({nom, def.den});
+    hoisted.addLocalFloorDiv(nom, def.den);
+    hReference.addLocalFloorDiv(nom, def.den);
+  }
+  const auto substitute = [&](bool isEq) {
+    unsigned numRows =
+        isEq ? constraint.getNumEqualities() : constraint.getNumInequalities();
+    for (unsigned i = 0; i < numRows; i++) {
+      auto row = isEq ? constraint.getEquality(i) : constraint.getInequality(i);
+      IntVector hoistedRow(numOuter + numLocals + 1);
+      hoistedRow.back() = row.back();
+      for (unsigned j = 0; j < numSymbols; j++) {
+        if (!inner[j]) {
+          hoistedRow[allToHoisted[j]] = row[j];
+          continue;
+        }
+        DynamicAPInt coeff = row[j];
+        if (coeff == 0)
+          continue;
+        if (isEq)
+          return false;
+        // The row must hold for every value of the inner symbol, so
+        // substitute the worst-case bound.
+        const IntVector &bound = coeff > 0 ? *lower[j] : *upper[j];
+        for (unsigned t = 0; t + 1 < bound.size(); t++)
+          hoistedRow[t] += coeff * bound[t];
+        hoistedRow.back() += coeff * bound.back();
+      }
+      for (unsigned k = 0; k < numLocals; k++)
+        hoistedRow[numOuter + k] = row[numSymbols + k];
+      if (isEq)
+        hoisted.addEquality(hoistedRow);
+      else
+        hoisted.addInequality(hoistedRow);
+    }
+    return true;
+  };
+  if (!substitute(true) || !substitute(false))
+    return fallback();
+
+  hoisted.removeRedundantConstraintsWhen(hReference);
+  hoisted.removeTrivialRedundancy();
+
+  Location loc = loop->getLoc();
+  OpBuilder builder(loop);
+
+  // Cast the outer operands to index for the affine.apply's.
+  SmallVector<Value> outerIndex(numSymbols);
+  for (unsigned j = 0; j < numSymbols; j++) {
+    if (inner[j] || !operands[j].getType().isIntOrIndex())
+      continue;
+    Value v = operands[j];
+    if (!isa<IndexType>(v.getType()))
+      v = arith::IndexCastOp::create(builder, loc, builder.getIndexType(), v);
+    outerIndex[j] = v;
+  }
+
+  // Replaces the address of `load` with a fresh GEP based on the lifted
+  // affine expression. `mapping` maps the values of the original loop to
+  // those of its clone, if any.
+  const auto applyLift = [&](LLVM::LoadOp load, AffineExpr expr,
+                             IRMapping *mapping) {
+    OpBuilder b(load);
+    MLIRContext *ctx = load.getContext();
+    // Drop the symbols that do not appear in the expression.
+    SmallVector<int> remap(numSymbols, -1);
+    SmallVector<unsigned> used;
+    expr.walk([&](AffineExpr e) {
+      if (auto symbol = dyn_cast<AffineSymbolExpr>(e)) {
+        unsigned pos = symbol.getPosition();
+        if (remap[pos] == -1) {
+          remap[pos] = used.size();
+          used.push_back(pos);
+        }
+      }
+    });
+    SmallVector<AffineExpr> replacement(numSymbols,
+                                        getAffineConstantExpr(0, ctx));
+    SmallVector<Value> applyOperands;
+    for (unsigned j : used) {
+      replacement[j] = getAffineSymbolExpr(remap[j], ctx);
+      Value v;
+      if (!inner[j]) {
+        v = outerIndex[j];
+      } else {
+        v = operands[j];
+        if (mapping)
+          v = mapping->lookupOrDefault(v);
+        if (!isa<IndexType>(v.getType()))
+          v = arith::IndexCastOp::create(b, loc, b.getIndexType(), v);
+      }
+      applyOperands.push_back(v);
+    }
+    auto map = AffineMap::get(0, used.size(), expr.replaceSymbols(replacement));
+    Value apply = affine::AffineApplyOp::create(b, loc, b.getIndexType(), map,
+                                                applyOperands);
+    Value addr = load.getAddr();
+    Value base = findGEPBase(addr);
+    auto offset = arith::IndexCastOp::create(b, loc, b.getI64Type(), apply);
+    Value gep = LLVM::GEPOp::create(b, loc, addr.getType(), b.getI8Type(), base,
+                                    {offset});
+    load.setOperand(gep);
+  };
+
+  // If nothing remains to be checked, lift in place.
+  if (hoisted.getNumInequalities() == 0 && hoisted.getNumEqualities() == 0) {
+    for (unsigned i = 0; i < loads.size(); i++)
+      if (exprs[i])
+        applyLift(loads[i], *exprs[i], nullptr);
+    return;
+  }
+
+  // Synthesize the check before the loop.
+  SmallVector<Value> checkValues;
+  SmallVector<Bound> checkBounds;
+  for (Value v : hOperands) {
+    if (auto cast = v.getDefiningOp<arith::IndexCastOp>()) {
+      checkValues.push_back(cast.getIn());
+      checkBounds.push_back(getSignedBounds(cast.getIn().getType()));
+    } else {
+      checkValues.push_back(v);
+      checkBounds.push_back(boundsOfValue(v));
+    }
+  }
+  Value condition =
+      synthesizeCheck(builder, loc, hoisted, hLocals, checkValues, checkBounds);
+
+  // Emit `if (check) { lifted loop } else { original loop }`.
+  auto ifOp = scf::IfOp::create(builder, loc, loop->getResultTypes(), condition,
+                                /*withElseRegion=*/true);
+
+  OpBuilder thenBuilder = ifOp.getThenBodyBuilder();
+  IRMapping mapping;
+  Operation *cloned = thenBuilder.clone(*loop, mapping);
+  for (unsigned i = 0; i < loads.size(); i++)
+    if (exprs[i])
+      applyLift(cast<LLVM::LoadOp>(mapping.lookup(loads[i].getOperation())),
+                *exprs[i], &mapping);
+  // Insert yield terminator at the end of the then block.
+  {
+    OpBuilder b(&ifOp.getThenRegion().front(),
+                ifOp.getThenRegion().front().end());
+    scf::YieldOp::create(b, loc, cloned->getResults());
+  }
+
+  Block *elseBlock = &ifOp.getElseRegion().front();
+  loop->moveBefore(elseBlock, elseBlock->end());
+  // Insert yield terminator at the end of the else block.
+  {
+    OpBuilder b(elseBlock, elseBlock->end());
+    scf::YieldOp::create(b, loc, loop->getResults());
+  }
+
+  // Uses of the loop results outside the `if` now refer to its results.
+  for (auto [result, ifResult] :
+       llvm::zip_equal(loop->getResults(), ifOp.getResults()))
+    result.replaceUsesWithIf(ifResult, [&](OpOperand &use) {
+      return !ifOp->isAncestor(use.getOwner());
+    });
 }
 
 void ArithToAffinePass::runOnOperation() {
@@ -1108,47 +1619,21 @@ void ArithToAffinePass::runOnOperation() {
     // TODO: This should still work but less accurate.
     return;
 
-  // Collect loads and stores and attempt to lift them.
-  // For now we consider only indexed load/stores. LLVM loads/stores can
-  // wait for later.
-  SmallVector<Value> tolift;
-  module->walk([&](Operation *op) {
-    if (auto indexed = dyn_cast<memref::IndexedAccessOpInterface>(op)) {
-      for (auto index : indexed.getIndices())
-        tolift.push_back(index);
-      return;
-    }
+  // For every loop, intersect the constraints of the loads in its region and
+  // emit a single check before it. Process innermost loops first, so that
+  // each load is handled by its closest enclosing loop.
+  SmallVector<Operation *> loops;
+  module->walk(
+      [&](LoopLikeOpInterface op) { loops.push_back(op.getOperation()); });
+  for (Operation *loop : llvm::reverse(loops))
+    liftLoop(loop);
 
-    if (auto load = dyn_cast<LLVM::LoadOp>(op)) {
-      tolift.push_back(load);
+  // Loads outside any loop are lifted individually.
+  module->walk([&](LLVM::LoadOp load) {
+    if (load->getParentOfType<LoopLikeOpInterface>())
       return;
-    }
+    liftLoadAddress(load);
   });
-
-  for (auto value : tolift) {
-    if (auto load = dyn_cast<LLVM::LoadOp>(value.getDefiningOp())) {
-      OpBuilder builder(load);
-      auto addr = load.getAddr();
-      auto loc = load.getLoc();
-      if (auto result = lift(addr); result.apply) {
-        auto branch = scf::IfOp::create(
-            builder, loc, result.condition,
-            [&](OpBuilder &builder, Location loc) {
-              auto gepBase = findGEPBase(addr);
-              auto cast = arith::IndexCastOp::create(
-                  builder, loc, builder.getI64Type(), result.apply);
-              auto gep =
-                  LLVM::GEPOp::create(builder, loc, addr.getType(),
-                                      builder.getI8Type(), gepBase, {cast});
-              scf::YieldOp::create(builder, loc, gep.getResult());
-            },
-            [&](OpBuilder &builder, Location loc) {
-              scf::YieldOp::create(builder, loc, addr);
-            });
-        load.setOperand(branch.getResult(0));
-      }
-    }
-  }
 }
 
 } // namespace
