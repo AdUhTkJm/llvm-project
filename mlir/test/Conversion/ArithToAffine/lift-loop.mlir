@@ -16,12 +16,9 @@
 module {
   llvm.func @load_in_loop(%base: !llvm.ptr, %ub: i32) -> i32 {
     %c0 = arith.constant 0 : i32
-    %c1 = arith.constant 1 : index
-    %c0_index = arith.constant 0 : index
-    %ub_idx = arith.index_cast %ub : i32 to index
-    %sum = scf.for %i = %c0_index to %ub_idx step %c1 iter_args(%acc = %c0) -> i32 {
-      %ext = arith.index_cast %i : index to i32
-      %addr = llvm.getelementptr %base[%ext] : (!llvm.ptr, i32) -> !llvm.ptr, i32
+    %c1 = arith.constant 1 : i32
+    %sum = scf.for %i = %c0 to %ub step %c1 iter_args(%acc = %c0) -> i32 : i32 {
+      %addr = llvm.getelementptr %base[%i] : (!llvm.ptr, i32) -> !llvm.ptr, i32
       %v = llvm.load %addr : !llvm.ptr -> i32
       %next = arith.addi %acc, %v : i32
       scf.yield %next : i32
