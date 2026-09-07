@@ -84,7 +84,8 @@ struct ArithToAffinePass : impl::ConvertArithToAffineBase<ArithToAffinePass> {
   std::optional<AffineMapResult> valueToAffine(Value value);
   std::optional<AffineResult> constructAffineMap(Value value,
                                                  const DimIndex &dimIndex);
-  AffineMapResult tidyResult(const AffineResult &result, ValueRange operands);
+  AffineMapResult tidyResult(const AffineResult &result, Value value,
+                             ValueRange operands);
   // Adds rows to `rel` bounding the variable at position `pos`, which
   // corresponds to `value`, based on the integer range analysis result.
   void addAnalyzedRangeConstraints(Value value, unsigned pos,
@@ -97,6 +98,22 @@ struct ArithToAffinePass : impl::ConvertArithToAffineBase<ArithToAffinePass> {
   void addValueBoundsConstraints(Value value, unsigned pos,
                                  const DenseMap<Value, unsigned> &valueToSymbol,
                                  IntegerRelation &reference) const;
+  // Adds rows to `reference` recording the conditions of the `scf.if` ops
+  // whose regions contain all uses of `value`, when those conditions are
+  // conjunctions of affine comparisons over the lifted operands (then
+  // branch), or disjunctions of them whose negation is again a conjunction
+  // (else branch). `valueToSymbol` maps each lifted operand to its symbol
+  // position in `reference`.
+  void addBranchConditionConstraints(
+      Value value, const DenseMap<Value, unsigned> &valueToSymbol,
+      IntegerRelation &reference);
+  // Adds the conjuncts of `cond` to `reference`. When `negated`, `cond` is
+  // known to be false instead, so only its disjuncts survive negation as
+  // conjuncts. Anything that is not an and/or (as appropriate) of signed
+  // affine comparisons is silently ignored.
+  void addConditionConstraints(Value cond, bool negated,
+                               const DenseMap<Value, unsigned> &valueToSymbol,
+                               IntegerRelation &reference);
   void getDependentDialects(DialectRegistry &registry) const override {
     impl::ConvertArithToAffineBase<ArithToAffinePass>::getDependentDialects(
         registry);
@@ -112,7 +129,7 @@ struct ArithToAffinePass : impl::ConvertArithToAffineBase<ArithToAffinePass> {
                         ArrayRef<Bound> bounds);
   // Returns sound signed bounds for `value`: its analyzed integer range if
   // available, otherwise the bounds of its type (64 bits for index).
-  Bound boundsOfValue(Value value) const;
+  Bound bounds(Value value) const;
   // Lifts the address of `load` individually, guarding the lifted address
   // with a per-load runtime check.
   void liftLoadAddress(LLVM::LoadOp load);
@@ -757,7 +774,7 @@ ArithToAffinePass::constructAffineMap(Value value, const DimIndex &dimIndex) {
     return AffineResult{expr, constraint, reference, std::move(locals)};
   }
 
-  if (isa<arith::ExtSIOp>(def) || isa<arith::IndexCastOp>(def)) {
+  if (isa<arith::ExtSIOp, arith::IndexCastOp>(def)) {
     // This never imposes any extra constraint, since we chose our internal
     // representation as signed.
     return constructAffineMap(def->getOperand(0), dimIndex);
@@ -833,7 +850,8 @@ ArithToAffinePass::constructAffineMap(Value value, const DimIndex &dimIndex) {
 }
 
 ArithToAffinePass::AffineMapResult
-ArithToAffinePass::tidyResult(const AffineResult &result, ValueRange operands) {
+ArithToAffinePass::tidyResult(const AffineResult &result, Value value,
+                              ValueRange operands) {
   const IntegerRelation &rConstraint = result.constraint;
 
   // No need to tidy expressions without operands.
@@ -945,6 +963,9 @@ ArithToAffinePass::tidyResult(const AffineResult &result, ValueRange operands) {
     addValueBoundsConstraints(operands[i], it->second, valueToSymbol,
                               reference);
   }
+  // Conditions of `scf.if` ops enclosing all uses of `value` hold wherever
+  // the runtime check is emitted, so they are facts as well.
+  addBranchConditionConstraints(value, valueToSymbol, reference);
   // The reference relation knows nothing about the local variables so far;
   // intersecting with the flag facts gives them their definitions. Rows
   // involving locals are then only removable when implied by the remaining
@@ -1115,6 +1136,133 @@ void ArithToAffinePass::addValueBoundsConstraints(
     reference.addInequality(fragment.getInequality(i));
 }
 
+void ArithToAffinePass::addConditionConstraints(
+    Value cond, bool negated, const DenseMap<Value, unsigned> &valueToSymbol,
+    IntegerRelation &reference) {
+  // A then branch gives a conjunction of the `and` operands; an else branch
+  // gives the negation, which is a conjunction only for `or` operands.
+  if (Operation *def = cond.getDefiningOp()) {
+    bool split = negated ? isa<arith::OrIOp>(def) : isa<arith::AndIOp>(def);
+    if (split) {
+      addConditionConstraints(def->getOperand(0), negated, valueToSymbol,
+                              reference);
+      addConditionConstraints(def->getOperand(1), negated, valueToSymbol,
+                              reference);
+      return;
+    }
+  }
+
+  auto cmp = cond.getDefiningOp<arith::CmpIOp>();
+  if (!cmp)
+    return;
+
+  arith::CmpIPredicate predicate = cmp.getPredicate();
+  if (negated)
+    predicate = arith::invertPredicate(predicate);
+
+  unsigned numSymbols = reference.getNumVars();
+  // The difference `lhs - rhs` as a row over the reference symbols.
+  SmallVector<Value> leaves;
+  collectOperandsUpChain(cmp.getLhs(), leaves);
+  collectOperandsUpChain(cmp.getRhs(), leaves);
+  SmallVector<Value> uniq;
+  DenseMap<Value, unsigned> localIndex;
+  for (Value leaf : leaves)
+    if (localIndex.try_emplace(leaf, uniq.size()).second)
+      uniq.push_back(leaf);
+  DimIndex dimIndex;
+  for (auto [i, v] : llvm::enumerate(uniq))
+    dimIndex[v] = i;
+
+  const auto sideToRow = [&](Value side) -> std::optional<IntVector> {
+    auto result = constructAffineMap(side, dimIndex);
+    if (!result)
+      return std::nullopt;
+    auto coeffs = extractCoefficients(result->expr, uniq.size());
+    if (!coeffs)
+      return std::nullopt;
+    IntVector row(numSymbols + 1);
+    for (unsigned i = 0; i + 1 < coeffs->size(); i++) {
+      if ((*coeffs)[i] == 0)
+        continue;
+      auto it = valueToSymbol.find(uniq[i]);
+      if (it == valueToSymbol.end())
+        return std::nullopt;
+      row[it->second] = (*coeffs)[i];
+    }
+    row.back() = coeffs->back();
+    return row;
+  };
+
+  auto lhs = sideToRow(cmp.getLhs());
+  auto rhs = sideToRow(cmp.getRhs());
+  if (!lhs || !rhs)
+    return;
+  IntVector diff(numSymbols + 1);
+  for (unsigned i = 0; i <= numSymbols; i++)
+    diff[i] = (*lhs)[i] - (*rhs)[i];
+
+  // The symbols are the sign-extended lifted operands, so only signed
+  // comparisons (and equality) are meaningful here.
+  switch (predicate) {
+  case arith::CmpIPredicate::eq:
+    reference.addEquality(diff);
+    break;
+  case arith::CmpIPredicate::sge:
+    reference.addInequality(diff);
+    break;
+  case arith::CmpIPredicate::sgt:
+    diff.back() -= 1;
+    reference.addInequality(diff);
+    break;
+  case arith::CmpIPredicate::sle:
+    for (auto &e : diff)
+      e *= -1;
+    reference.addInequality(diff);
+    break;
+  case arith::CmpIPredicate::slt:
+    for (auto &e : diff)
+      e *= -1;
+    diff.back() -= 1;
+    reference.addInequality(diff);
+    break;
+  default:
+    break;
+  }
+}
+
+void ArithToAffinePass::addBranchConditionConstraints(
+    Value value, const DenseMap<Value, unsigned> &valueToSymbol,
+    IntegerRelation &reference) {
+  // Find the least common ancestor region of all uses of `value`; the
+  // conditions of the `scf.if` ops enclosing it hold at every use.
+  Region *lca = nullptr;
+  for (OpOperand &use : value.getUses()) {
+    Region *region = use.getOwner()->getBlock()->getParent();
+    while (lca && lca != region && !lca->isAncestor(region)) {
+      Operation *op = lca->getParentOp();
+      lca = op ? op->getParentRegion() : nullptr;
+    }
+    if (!lca)
+      lca = region;
+  }
+  if (!lca)
+    return;
+
+  // Walk up the region tree. `child` is always the region directly inside
+  // `op` that lies on the path from `lca`.
+  for (Region *child = lca; Operation *op = child->getParentOp();) {
+    if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      bool inElse = child == &ifOp.getElseRegion();
+      addConditionConstraints(ifOp.getCondition(), /*negated=*/inElse,
+                              valueToSymbol, reference);
+    }
+    child = op->getParentRegion();
+    if (!child)
+      break;
+  }
+}
+
 std::optional<ArithToAffinePass::AffineMapResult>
 ArithToAffinePass::valueToAffine(Value value) {
   // We trace back the arithmetic computations of the given value till a valid
@@ -1134,7 +1282,7 @@ ArithToAffinePass::valueToAffine(Value value) {
   if (!maybeResult)
     return std::nullopt;
 
-  return tidyResult(*maybeResult, operands);
+  return tidyResult(*maybeResult, value, operands);
 }
 
 ArithToAffinePass::LiftResult ArithToAffinePass::lift(Value value) {
@@ -1160,7 +1308,7 @@ ArithToAffinePass::LiftResult ArithToAffinePass::lift(Value value) {
       checkBounds.push_back(getSignedBounds(cast.getIn().getType()));
     } else {
       checkValues.push_back(operand);
-      checkBounds.push_back(boundsOfValue(operand));
+      checkBounds.push_back(bounds(operand));
     }
   }
   Value condition =
@@ -1170,7 +1318,7 @@ ArithToAffinePass::LiftResult ArithToAffinePass::lift(Value value) {
   return {apply, condition};
 }
 
-Bound ArithToAffinePass::boundsOfValue(Value value) const {
+Bound ArithToAffinePass::bounds(Value value) const {
   if (auto *lattice =
           solver->lookupState<dataflow::IntegerValueRangeLattice>(value);
       lattice && !lattice->getValue().isUninitialized()) {
@@ -1266,7 +1414,7 @@ ArithToAffinePass::computeOuterBound(Value inner, BoundType boundType,
   }
 
   IntVector result(hoistedOperands.size() + 1);
-  for (auto [index, coeff] : terms)
+  for (const auto &[index, coeff] : terms)
     result[index] += coeff;
   result.back() = maybeCoeffs->back();
   return result;
@@ -1463,7 +1611,7 @@ void ArithToAffinePass::liftLoop(Operation *loop) {
           hoistedRow[allToHoisted[j]] = row[j];
           continue;
         }
-        DynamicAPInt coeff = row[j];
+        const DynamicAPInt &coeff = row[j];
         if (coeff == 0)
           continue;
         if (isEq)
@@ -1568,7 +1716,7 @@ void ArithToAffinePass::liftLoop(Operation *loop) {
       checkBounds.push_back(getSignedBounds(cast.getIn().getType()));
     } else {
       checkValues.push_back(v);
-      checkBounds.push_back(boundsOfValue(v));
+      checkBounds.push_back(bounds(v));
     }
   }
   Value condition =
@@ -1578,25 +1726,28 @@ void ArithToAffinePass::liftLoop(Operation *loop) {
   auto ifOp = scf::IfOp::create(builder, loc, loop->getResultTypes(), condition,
                                 /*withElseRegion=*/true);
 
-  OpBuilder thenBuilder = ifOp.getThenBodyBuilder();
-  IRMapping mapping;
-  Operation *cloned = thenBuilder.clone(*loop, mapping);
-  for (unsigned i = 0; i < loads.size(); i++)
-    if (exprs[i])
-      applyLift(cast<LLVM::LoadOp>(mapping.lookup(loads[i].getOperation())),
-                *exprs[i], &mapping);
-  // Insert yield terminator at the end of the then block.
+  // Then block: clone the loop, apply lifts, and yield the results.
   {
-    OpBuilder b(&ifOp.getThenRegion().front(),
-                ifOp.getThenRegion().front().end());
+    Block &thenBlock = ifOp.getThenRegion().front();
+    if (thenBlock.mightHaveTerminator())
+      thenBlock.getTerminator()->erase();
+    OpBuilder b(&thenBlock, thenBlock.end());
+    IRMapping mapping;
+    Operation *cloned = b.clone(*loop, mapping);
+    for (unsigned i = 0; i < loads.size(); i++)
+      if (exprs[i])
+        applyLift(cast<LLVM::LoadOp>(mapping.lookup(loads[i].getOperation())),
+                  *exprs[i], &mapping);
     scf::YieldOp::create(b, loc, cloned->getResults());
   }
 
-  Block *elseBlock = &ifOp.getElseRegion().front();
-  loop->moveBefore(elseBlock, elseBlock->end());
-  // Insert yield terminator at the end of the else block.
+  // Else block: move the original loop and yield its results.
   {
-    OpBuilder b(elseBlock, elseBlock->end());
+    Block &elseBlock = ifOp.getElseRegion().front();
+    if (elseBlock.mightHaveTerminator())
+      elseBlock.getTerminator()->erase();
+    loop->moveBefore(&elseBlock, elseBlock.end());
+    OpBuilder b(&elseBlock, elseBlock.end());
     scf::YieldOp::create(b, loc, loop->getResults());
   }
 
