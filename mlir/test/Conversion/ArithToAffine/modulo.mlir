@@ -1,3 +1,32 @@
+// RUN: mlir-opt -convert-arith-to-affine %s | FileCheck %s
+
+// 5-point stencil: every load is lifted in place via affine.apply. The
+// user's interior/boundary scf.if is preserved; no runtime overflow check
+// is synthesized because the loop bounds prove all constraints.
+// CHECK:       #map = affine_map<()[s0] -> ((s0 - 1024) * 4)>
+// CHECK:       #map1 = affine_map<()[s0] -> ((s0 + 1024) * 4)>
+// CHECK:       #map2 = affine_map<()[s0] -> ((s0 - 1) * 4)>
+// CHECK:       #map3 = affine_map<()[s0] -> ((s0 + 1) * 4)>
+// CHECK:       #map4 = affine_map<()[s0] -> (s0 * 4)>
+// CHECK-LABEL: func.func @apply_5point_stencil
+// CHECK:       scf.for
+// CHECK:       scf.if
+// CHECK:         affine.apply #map
+// CHECK-NOT:     i65
+// CHECK:         llvm.load
+// CHECK:         affine.apply #map1
+// CHECK-NOT:     i65
+// CHECK:         llvm.load
+// CHECK:         affine.apply #map2
+// CHECK-NOT:     i65
+// CHECK:         llvm.load
+// CHECK:         affine.apply #map3
+// CHECK-NOT:     i65
+// CHECK:         llvm.load
+// CHECK:       } else {
+// CHECK:         affine.apply #map4
+// CHECK-NOT:     i65
+// CHECK:         llvm.load
 module {
   func.func @apply_5point_stencil(
     %in_ptr: !llvm.ptr, 

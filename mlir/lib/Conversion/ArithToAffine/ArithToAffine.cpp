@@ -507,9 +507,6 @@ Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc,
   assert(rel.getNumLocalVars() == localDefs.size() &&
          "local variable definitions out of sync with constraint");
 
-  llvm::errs() << "synthesizing:\n";
-  rel.dump();
-
   // The values of the columns of `rel`: the symbols followed by the local
   // variables materialized from their definitions.
   SmallVector<Value> values(inValues.begin(), inValues.end());
