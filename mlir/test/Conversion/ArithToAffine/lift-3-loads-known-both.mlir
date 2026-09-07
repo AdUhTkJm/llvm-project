@@ -1,32 +1,21 @@
 // RUN: mlir-opt -convert-arith-to-affine %s | FileCheck %s
 
-// Three loads inside a loop: i-1, i, i+1. All three should be lifted into
-// the then branch with affine.apply; the else branch keeps original GEPs.
+// Three loads inside a loop: i-1, i, i+1. With both loop bounds known
+// (0 to 100), every constraint is provable, so the loads are lifted in
+// place with affine.apply and no runtime overflow check is synthesized.
 // CHECK:       #map = affine_map<()[s0] -> ((s0 - 1) * 4)>
 // CHECK:       #map1 = affine_map<()[s0] -> (s0 * 4)>
 // CHECK:       #map2 = affine_map<()[s0] -> ((s0 + 1) * 4)>
 // CHECK-LABEL: func.func @f
-// CHECK:       scf.if
-// Then: lifted loads via affine.apply
 // CHECK:       scf.for
 // CHECK:         affine.apply #map
-// CHECK:         llvm.getelementptr
+// CHECK-NOT:     i65
 // CHECK:         llvm.load
 // CHECK:         affine.apply #map1
-// CHECK:         llvm.getelementptr
+// CHECK-NOT:     i65
 // CHECK:         llvm.load
 // CHECK:         affine.apply #map2
-// CHECK:         llvm.getelementptr
-// CHECK:         llvm.load
-// CHECK:       } else {
-// Else: original loads via plain GEP
-// CHECK:       scf.for
-// CHECK-NOT:     affine.apply
-// CHECK:         llvm.getelementptr
-// CHECK:         llvm.load
-// CHECK:         llvm.getelementptr
-// CHECK:         llvm.load
-// CHECK:         llvm.getelementptr
+// CHECK-NOT:     i65
 // CHECK:         llvm.load
 module {
   func.func @f(%in: !llvm.ptr, %out: !llvm.ptr) {
