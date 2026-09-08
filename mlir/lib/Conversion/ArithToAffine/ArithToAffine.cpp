@@ -39,7 +39,8 @@ using Bound = std::pair<DynamicAPInt, DynamicAPInt>;
 
 // The definition of a local variable introduced for a division
 // or modulus. The variable represents `nom / den`, where
-// `nom` is a coefficient vector over the symbols and the local variables defined *before* this one.
+// `nom` is a coefficient vector over the symbols and the local variables
+// defined *before* this one.
 struct LocalDef {
   IntVector nom;
   DynamicAPInt den;
@@ -104,9 +105,10 @@ struct ArithToAffinePass : impl::ConvertArithToAffineBase<ArithToAffinePass> {
   // branch), or disjunctions of them whose negation is again a conjunction
   // (else branch). `valueToSymbol` maps each lifted operand to its symbol
   // position in `reference`.
-  void addBranchConditionConstraints(
-      Value value, const DenseMap<Value, unsigned> &valueToSymbol,
-      IntegerRelation &reference);
+  void
+  addBranchConditionConstraints(Value value,
+                                const DenseMap<Value, unsigned> &valueToSymbol,
+                                IntegerRelation &reference);
   // Adds the conjuncts of `cond` to `reference`. When `negated`, `cond` is
   // known to be false instead, so only its disjuncts survive negation as
   // conjuncts. Anything that is not an and/or (as appropriate) of signed
@@ -133,10 +135,49 @@ struct ArithToAffinePass : impl::ConvertArithToAffineBase<ArithToAffinePass> {
   // Lifts the address of `load` individually, guarding the lifted address
   // with a per-load runtime check.
   void liftLoadAddress(LLVM::LoadOp load);
-  // Intersects the lifting constraints of all loads directly inside `loop`
-  // and emits a single check before it:
-  //   if (check) { lifted loop } else { original loop }
-  // Falls back to per-load lifting when the constraints cannot be hoisted.
+  // The plan for lifting a loop nest as a whole.
+  struct LoopLiftPlan {
+    // The loads in the nest, in preorder.
+    SmallVector<LLVM::LoadOp> loads;
+    // The affine expression of each load address over `operands`, or nullopt
+    // when the address is not representible.
+    SmallVector<std::optional<AffineExpr>> exprs;
+    // The union of the leaf operands of all the load address expressions.
+    SmallVector<Value> operands;
+    // For each operand, whether it is defined inside the outermost loop.
+    SmallVector<bool> inner;
+    // The index-cast versions of the outer operands, filled in when the
+    // plan is emitted.
+    SmallVector<Value> outerIndex;
+    // The remaining check rows over the hoisted symbols (the operands
+    // defined before the outermost loop, so that the synthesized check does
+    // not violate dominance) and `hLocals`. Empty when every constraint is
+    // implied, in which case the loads are lifted in place.
+    IntegerRelation hoisted = IntegerRelation(PresburgerSpace::getSetSpace(0));
+    // Definitions of the local variables of `hoisted`, in column order.
+    SmallVector<LocalDef> hLocals;
+    // The values of the hoisted symbols and their sound signed bounds.
+    SmallVector<Value> checkValues;
+    SmallVector<Bound> checkBounds;
+  };
+  // Computes the unified lifting plan for the nest rooted at `loop`:
+  // intersects the lifting constraints of all loads inside `loop`, including
+  // those of nested loops, and expresses the remaining rows over the values
+  // defined before `loop`: symbols defined inside `loop` (e.g. the induction
+  // variables of nested loops) are substituted by their worst-case bounds in
+  // terms of the values enclosing `loop`, so that the synthesized check does
+  // not violate dominance. Returns nullopt when the constraints cannot be
+  // hoisted.
+  std::optional<LoopLiftPlan> computeLoopPlan(Operation *loop);
+  // Emits the speculative code for `plan`: lifts the loads in place when no
+  // check is needed, and otherwise synthesizes the check before `loop` and
+  // emits
+  //   if (check) { lifted loop nest } else { original loop nest }.
+  void emitSpeculativeLoop(Operation *loop, LoopLiftPlan &plan);
+  // Orchestrates the lifting of the nest rooted at `loop`: computes the plan
+  // and emits it. Falls back to per-load lifting of the loads directly
+  // inside `loop` and recursive processing of the nested loops when the
+  // constraints cannot be hoisted.
   void liftLoop(Operation *loop);
   // Computes a bound of `inner` (a symbol defined inside `loop`) in terms of
   // values defined outside `loop`, expressed as coefficients over the
@@ -250,8 +291,7 @@ extractCoefficients(AffineExpr expr, unsigned numSymbols,
         return std::nullopt;
 
       DynamicAPInt den(div.getValue());
-      auto nom =
-          extractCoefficients(bin.getLHS(), numSymbols, rel, locals);
+      auto nom = extractCoefficients(bin.getLHS(), numSymbols, rel, locals);
       if (!nom)
         return std::nullopt;
       // Convert ceildiv to floordiv:
@@ -349,7 +389,7 @@ DynamicAPInt floordiv(const DynamicAPInt &x, const DynamicAPInt &y) {
   return x < 0 ? q - 1 : q;
 }
 
-// Shift elements starting from `n` by `shift` amount to the right. 
+// Shift elements starting from `n` by `shift` amount to the right.
 IntVector shift(const IntVector &vec, unsigned n, unsigned shift) {
   IntVector result(vec.size() + shift);
   for (unsigned i = 0; i < n; i++)
@@ -640,8 +680,7 @@ Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc,
           builder, loc, negRem, arith::SubIOp::create(builder, loc, q, one), q);
     }
     values.push_back(q);
-    bounds.push_back({floordiv(min, def.den),
-                      floordiv(max, def.den)});
+    bounds.push_back({floordiv(min, def.den), floordiv(max, def.den)});
   }
 
   const auto synthesize = [&](bool isEq) {
@@ -1440,21 +1479,14 @@ void ArithToAffinePass::liftLoadAddress(LLVM::LoadOp load) {
   load.setOperand(branch.getResult(0));
 }
 
-void ArithToAffinePass::liftLoop(Operation *loop) {
-  // Collect the loads directly inside `loop`; loads of nested loops are
-  // handled when those loops are processed.
+std::optional<ArithToAffinePass::LoopLiftPlan>
+ArithToAffinePass::computeLoopPlan(Operation *loop) {
+  // Collect every load in the nest, including those of nested loops: a
+  // single unified check is emitted for the whole nest.
   SmallVector<LLVM::LoadOp> loads;
-  loop->walk([&](LLVM::LoadOp load) {
-    if (load->getParentOfType<LoopLikeOpInterface>().getOperation() == loop)
-      loads.push_back(load);
-  });
+  loop->walk([&](LLVM::LoadOp load) { loads.push_back(load); });
   if (loads.empty())
-    return;
-
-  const auto fallback = [&]() {
-    for (auto load : loads)
-      liftLoadAddress(load);
-  };
+    return std::nullopt;
 
   // Union of the leaf operands of all the load address expressions.
   SmallVector<Value> operands;
@@ -1517,7 +1549,7 @@ void ArithToAffinePass::liftLoop(Operation *loop) {
     any = true;
   }
   if (!any)
-    return fallback();
+    return std::nullopt;
 
   // Record facts known about the symbols (analyzed ranges, value bounds) in
   // a local-free relation, then merge them into `reference`.
@@ -1545,7 +1577,7 @@ void ArithToAffinePass::liftLoop(Operation *loop) {
   for (const LocalDef &def : locals)
     for (unsigned j = 0; j < numSymbols; j++)
       if (inner[j] && def.nom[j] != 0)
-        return fallback();
+        return std::nullopt;
 
   // Determine the inner symbols the remaining constraints refer to, and
   // compute their bounds in terms of the outer symbols.
@@ -1572,7 +1604,7 @@ void ArithToAffinePass::liftLoop(Operation *loop) {
     upper[j] =
         computeOuterBound(operands[j], BoundType::UB, loop, hOperands, hIndex);
     if (!lower[j] || !upper[j])
-      return fallback();
+      return std::nullopt;
   }
 
   // Substitute the worst-case bound of every inner symbol into the
@@ -1630,23 +1662,45 @@ void ArithToAffinePass::liftLoop(Operation *loop) {
     return true;
   };
   if (!substitute(true) || !substitute(false))
-    return fallback();
+    return std::nullopt;
 
   hoisted.removeRedundantConstraintsWhen(hReference);
   hoisted.removeTrivialRedundancy();
 
+  LoopLiftPlan plan;
+  plan.loads = std::move(loads);
+  plan.exprs = std::move(exprs);
+  plan.operands = std::move(operands);
+  plan.inner = std::move(inner);
+  plan.hoisted = hoisted;
+  plan.hLocals = std::move(hLocals);
+  for (Value v : hOperands) {
+    if (auto cast = v.getDefiningOp<arith::IndexCastOp>()) {
+      plan.checkValues.push_back(cast.getIn());
+      plan.checkBounds.push_back(getSignedBounds(cast.getIn().getType()));
+    } else {
+      plan.checkValues.push_back(v);
+      plan.checkBounds.push_back(bounds(v));
+    }
+  }
+  return plan;
+}
+
+void ArithToAffinePass::emitSpeculativeLoop(Operation *loop,
+                                            LoopLiftPlan &plan) {
+  unsigned numSymbols = plan.operands.size();
   Location loc = loop->getLoc();
   OpBuilder builder(loop);
 
   // Cast the outer operands to index for the affine.apply's.
-  SmallVector<Value> outerIndex(numSymbols);
+  plan.outerIndex.assign(numSymbols, Value());
   for (unsigned j = 0; j < numSymbols; j++) {
-    if (inner[j] || !operands[j].getType().isIntOrIndex())
+    if (plan.inner[j] || !plan.operands[j].getType().isIntOrIndex())
       continue;
-    Value v = operands[j];
+    Value v = plan.operands[j];
     if (!isa<IndexType>(v.getType()))
       v = arith::IndexCastOp::create(builder, loc, builder.getIndexType(), v);
-    outerIndex[j] = v;
+    plan.outerIndex[j] = v;
   }
 
   // Replaces the address of `load` with a fresh GEP based on the lifted
@@ -1674,10 +1728,10 @@ void ArithToAffinePass::liftLoop(Operation *loop) {
     for (unsigned j : used) {
       replacement[j] = getAffineSymbolExpr(remap[j], ctx);
       Value v;
-      if (!inner[j]) {
-        v = outerIndex[j];
+      if (!plan.inner[j]) {
+        v = plan.outerIndex[j];
       } else {
-        v = operands[j];
+        v = plan.operands[j];
         if (mapping)
           v = mapping->lookupOrDefault(v);
         if (!isa<IndexType>(v.getType()))
@@ -1697,27 +1751,17 @@ void ArithToAffinePass::liftLoop(Operation *loop) {
   };
 
   // If nothing remains to be checked, lift in place.
-  if (hoisted.getNumInequalities() == 0 && hoisted.getNumEqualities() == 0) {
-    for (unsigned i = 0; i < loads.size(); i++)
-      if (exprs[i])
-        applyLift(loads[i], *exprs[i], nullptr);
+  if (plan.hoisted.getNumInequalities() == 0 &&
+      plan.hoisted.getNumEqualities() == 0) {
+    for (unsigned i = 0; i < plan.loads.size(); i++)
+      if (plan.exprs[i])
+        applyLift(plan.loads[i], *plan.exprs[i], nullptr);
     return;
   }
 
   // Synthesize the check before the loop.
-  SmallVector<Value> checkValues;
-  SmallVector<Bound> checkBounds;
-  for (Value v : hOperands) {
-    if (auto cast = v.getDefiningOp<arith::IndexCastOp>()) {
-      checkValues.push_back(cast.getIn());
-      checkBounds.push_back(getSignedBounds(cast.getIn().getType()));
-    } else {
-      checkValues.push_back(v);
-      checkBounds.push_back(bounds(v));
-    }
-  }
-  Value condition =
-      synthesizeCheck(builder, loc, hoisted, hLocals, checkValues, checkBounds);
+  Value condition = synthesizeCheck(builder, loc, plan.hoisted, plan.hLocals,
+                                    plan.checkValues, plan.checkBounds);
 
   // Emit `if (check) { lifted loop } else { original loop }`.
   auto ifOp = scf::IfOp::create(builder, loc, loop->getResultTypes(), condition,
@@ -1731,10 +1775,11 @@ void ArithToAffinePass::liftLoop(Operation *loop) {
     OpBuilder b(&thenBlock, thenBlock.end());
     IRMapping mapping;
     Operation *cloned = b.clone(*loop, mapping);
-    for (unsigned i = 0; i < loads.size(); i++)
-      if (exprs[i])
-        applyLift(cast<LLVM::LoadOp>(mapping.lookup(loads[i].getOperation())),
-                  *exprs[i], &mapping);
+    for (unsigned i = 0; i < plan.loads.size(); i++)
+      if (plan.exprs[i])
+        applyLift(
+            cast<LLVM::LoadOp>(mapping.lookup(plan.loads[i].getOperation())),
+            *plan.exprs[i], &mapping);
     scf::YieldOp::create(b, loc, cloned->getResults());
   }
 
@@ -1756,6 +1801,32 @@ void ArithToAffinePass::liftLoop(Operation *loop) {
     });
 }
 
+void ArithToAffinePass::liftLoop(Operation *loop) {
+  // Compute the unified plan for the whole nest and emit it. When the
+  // constraints cannot be hoisted before `loop`, fall back to lifting the
+  // loads directly inside `loop` individually and processing the nested
+  // loops separately.
+  std::optional<LoopLiftPlan> plan = computeLoopPlan(loop);
+  if (plan) {
+    emitSpeculativeLoop(loop, *plan);
+    return;
+  }
+
+  // Fallback on failure.
+  SmallVector<Operation *> nestedLoops;
+  loop->walk([&](LoopLikeOpInterface nested) {
+    if (nested.getOperation() != loop &&
+        nested->getParentOfType<LoopLikeOpInterface>().getOperation() == loop)
+      nestedLoops.push_back(nested.getOperation());
+  });
+  for (Operation *nested : nestedLoops)
+    liftLoop(nested);
+  loop->walk([&](LLVM::LoadOp load) {
+    if (load->getParentOfType<LoopLikeOpInterface>().getOperation() == loop)
+      liftLoadAddress(load);
+  });
+}
+
 void ArithToAffinePass::runOnOperation() {
   mlir::DataFlowSolver mySolver;
   solver = &mySolver;
@@ -1767,13 +1838,20 @@ void ArithToAffinePass::runOnOperation() {
     // TODO: This should still work but less accurate.
     return;
 
-  // For every loop, intersect the constraints of the loads in its region and
-  // emit a single check before it. Process innermost loops first, so that
-  // each load is handled by its closest enclosing loop.
+  // For every outermost loop, intersect the constraints of the loads in its
+  // region (including those of nested loops) and emit a single check before
+  // it, so that each nest is raised at most once. The loops are collected
+  // before any lifting happens: lifting moves the original loop into the
+  // else branch of the check and clones it into the then branch, and neither
+  // copy is revisited. Nested loops are handled by liftLoop itself: either
+  // together with their enclosing loop, or recursively when hoisting to the
+  // enclosing loop fails.
   SmallVector<Operation *> loops;
-  module->walk(
-      [&](LoopLikeOpInterface op) { loops.push_back(op.getOperation()); });
-  for (Operation *loop : llvm::reverse(loops))
+  module->walk([&](LoopLikeOpInterface op) {
+    if (!op->getParentOfType<LoopLikeOpInterface>())
+      loops.push_back(op.getOperation());
+  });
+  for (Operation *loop : loops)
     liftLoop(loop);
 
   // Loads outside any loop are lifted individually.
