@@ -1050,16 +1050,246 @@ Operation *getOwner(Value value) {
   return value.getDefiningOp();
 }
 
+// The induction variable of a do-while style `scf.while` loop. Unlike
+// `scf.for`, `scf.while` does not implement ValueBoundsOpInterface, so the
+// symbolic constraints of its induction variable are extracted manually.
+//
+// We only consider do-while operations of this form:
+//
+//   %result = scf.while (%iv = %init) : (i32) -> i32 {
+//     %next = arith.addi %iv, %step : i32
+//     %cond = arith.cmpi <pred>, %next, %bound : i32
+//     scf.condition(%cond) %next : i32
+//   } do {
+//   ^bb0(%iter_arg: i32):
+//     scf.yield %iter_arg : i32
+//   }
+struct WhileInductionInfo {
+  Value init;
+  Value next;
+  Value step;
+  bool negative = false;
+  Value bound;
+  // We normalize the predicate to `pred(next, bound)`.
+  arith::CmpIPredicate pred;
+};
+
+std::optional<WhileInductionInfo> matchWhileInduction(Value value) {
+  auto arg = dyn_cast<BlockArgument>(value);
+  if (!arg || !arg.getType().isIntOrIndex())
+    return std::nullopt;
+  auto op = dyn_cast<scf::WhileOp>(getOwner(value));
+  if (!op || arg.getOwner() != op.getBeforeBody())
+    return std::nullopt;
+  unsigned i = arg.getArgNumber();
+  auto cond = cast<scf::ConditionOp>(op.getBeforeBody()->getTerminator());
+  auto yield = cast<scf::YieldOp>(op.getAfterBody()->getTerminator());
+
+  // Collect the constraints of the loop condition.
+  SmallVector<arith::CmpIOp> cmps;
+  SmallVector<Value> worklist{cond.getCondition()};
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    if (auto andOp = v.getDefiningOp<arith::AndIOp>()) {
+      worklist.push_back(andOp.getLhs());
+      worklist.push_back(andOp.getRhs());
+    } else if (auto cmp = v.getDefiningOp<arith::CmpIOp>()) {
+      cmps.push_back(cmp);
+    }
+  }
+
+  // Try to match the %next = arith.addi (or subi).
+  for (unsigned j = 0, e = cond.getArgs().size(); j < e; j++) {
+    Value next = cond.getArgs()[j];
+    Value step;
+    bool negative = false;
+    if (next != arg) {
+      if (auto add = next.getDefiningOp<arith::AddIOp>()) {
+        if (add.getLhs() == arg)
+          step = add.getRhs();
+        else if (add.getRhs() == arg)
+          step = add.getLhs();
+        else
+          continue;
+      } else if (auto sub = next.getDefiningOp<arith::SubIOp>()) {
+        if (sub.getLhs() != arg)
+          continue;
+        step = sub.getRhs();
+        negative = true;
+      } else {
+        continue;
+      }
+    }
+
+    // The after-region argument receiving `next` must be yielded back as
+    // the next value of `arg`.
+    auto forwarded = dyn_cast<BlockArgument>(yield.getOperand(i));
+    if (!forwarded || forwarded.getOwner() != op.getAfterBody() ||
+        forwarded.getArgNumber() != j)
+      continue;
+
+    // Find the bound. We need to make sure the bound is loop-invariant.
+    for (arith::CmpIOp cmp : cmps) {
+      Value bound;
+      arith::CmpIPredicate pred = cmp.getPredicate();
+      if (cmp.getLhs() == next) {
+        bound = cmp.getRhs();
+      } else if (cmp.getRhs() == next) {
+        bound = cmp.getLhs();
+        // Normalize to `pred(next, bound)`.
+        switch (pred) {
+        case arith::CmpIPredicate::slt:
+          pred = arith::CmpIPredicate::sgt;
+          break;
+        case arith::CmpIPredicate::sle:
+          pred = arith::CmpIPredicate::sge;
+          break;
+        case arith::CmpIPredicate::sgt:
+          pred = arith::CmpIPredicate::slt;
+          break;
+        case arith::CmpIPredicate::sge:
+          pred = arith::CmpIPredicate::sle;
+          break;
+        default:
+          break;
+        }
+      } else {
+        continue;
+      }
+      SmallVector<Value> leaves;
+      collectOperandsUpChain(bound, leaves);
+      bool invariant = llvm::all_of(leaves, [&](Value leaf) {
+        llvm::APInt constant;
+        if (matchPattern(leaf, m_ConstantInt(&constant)))
+          return true;
+        return !valueInLoop(leaf, op);
+      });
+      if (!invariant)
+        continue;
+
+      WhileInductionInfo info;
+      info.init = op.getInits()[i];
+      info.bound = bound;
+      info.pred = pred;
+      if (next != arg) {
+        info.step = step;
+        info.negative = negative;
+      }
+      return info;
+    }
+  }
+  return std::nullopt;
+}
+
+// Computes a bound of `value` (a recognized `scf.while` induction variable)
+// in the same shape as ValueBoundsConstraintSet::computeBound, like a for-loop.
+//
+// We believe these loops are generated from loop rotation, and so will execute
+// at least once.
+//
+// Under that assumption, the following holds for every entry:
+//   - with a constant step of sign s (the variable is forwarded unchanged
+//     when the step is zero):
+//       iv >= init (s > 0), iv <= init (s < 0), iv == init (s == 0);
+//   - for the signed predicates, from the loop condition (which the entries
+//     after the first satisfy unconditionally):
+//       slt: iv <= bound - 1,  sle: iv <= bound,
+//       sgt: iv >= bound + 1,  sge: iv >= bound;
+//   - for `ne`, assuming the induction hits `bound` exactly so that the
+//     loop exits there, the last entry is `bound - step`:
+//       iv <= bound - step (s > 0), iv >= bound - step (s < 0).
+//
+// The directional fact additionally assumes that the induction update does
+// not wrap: otherwise the induction variable would not stay on one side of
+// the initial value in a non-terminating loop.
+LogicalResult computeWhileInductionBound(Value value, BoundType type,
+                                         AffineMap &resultMap,
+                                         ValueDimList &mapOperands) {
+  std::optional<WhileInductionInfo> info = matchWhileInduction(value);
+  if (!info)
+    return failure();
+
+  // Signed value of the constant step; nullopt when the step is not a
+  // constant (then only the condition-based facts are available), and zero
+  // when the induction variable is forwarded unchanged.
+  std::optional<int64_t> step;
+  if (!info->step) {
+    step = 0;
+  } else {
+    llvm::APInt value;
+    if (matchPattern(info->step, m_ConstantInt(&value)) &&
+        value.getBitWidth() <= 64)
+      step = info->negative ? -(int64_t)value.getSExtValue()
+                            : (int64_t)value.getSExtValue();
+  }
+
+  // The bound is expressed over the initial value, the bound, and the step
+  // as symbols.
+  SmallVector<Value> atoms;
+  DenseMap<Value, unsigned> atomIndex;
+  const auto atom = [&](Value v) {
+    auto [it, inserted] = atomIndex.try_emplace(v, atoms.size());
+    if (inserted)
+      atoms.push_back(v);
+    return getAffineSymbolExpr(it->second, value.getContext());
+  };
+
+  AffineExpr stepExpr;
+  if (info->step) {
+    AffineExpr magnitude = atom(info->step);
+    stepExpr = info->negative
+                   ? getAffineConstantExpr(0, value.getContext()) - magnitude
+                   : magnitude;
+  }
+
+  AffineExpr boundExpr;
+  if (type == BoundType::LB) {
+    if (step && *step >= 0) {
+      boundExpr = atom(info->init);
+    } else if (info->pred == arith::CmpIPredicate::sgt) {
+      boundExpr = atom(info->bound) + 1;
+    } else if (info->pred == arith::CmpIPredicate::sge) {
+      boundExpr = atom(info->bound);
+    } else if (info->pred == arith::CmpIPredicate::ne && step && *step < 0) {
+      boundExpr = atom(info->bound) - *step;
+    } else {
+      return failure();
+    }
+  } else {
+    if (step && *step <= 0) {
+      boundExpr = atom(info->init);
+    } else if (info->pred == arith::CmpIPredicate::slt) {
+      boundExpr = atom(info->bound) - 1;
+    } else if (info->pred == arith::CmpIPredicate::sle ||
+               (info->pred == arith::CmpIPredicate::ne && step && *step > 0)) {
+      boundExpr = info->pred == arith::CmpIPredicate::ne
+                      ? atom(info->bound) - *step
+                      : atom(info->bound);
+    } else {
+      return failure();
+    }
+  }
+
+  resultMap = AffineMap::get(0, atoms.size(), boundExpr);
+  mapOperands.clear();
+  for (Value v : atoms)
+    mapOperands.emplace_back(v, std::nullopt);
+  return success();
+}
+
 void ArithToAffinePass::addValueBoundsConstraints(
     Value value, unsigned pos, const DenseMap<Value, unsigned> &valueToSymbol,
     IntegerRelation &reference) const {
   // Bounds can only be computed for index/integer-typed values, and require
   // the owner of the value to implement ValueBoundsOpInterface (e.g. an
-  // scf.for loop for its induction variable).
+  // scf.for loop for its induction variable). The induction variables of
+  // scf.while loops, which do not implement the interface, are handled by
+  // the manual fallback below.
   if (!value.getType().isIntOrIndex())
     return;
   Operation *owner = getOwner(value);
-  if (!owner || !isa<ValueBoundsOpInterface>(owner))
+  if (!owner ||
+      (!isa<ValueBoundsOpInterface>(owner) && !isa<scf::WhileOp>(owner)))
     return;
 
   MLIRContext *ctx = value.getContext();
@@ -1093,8 +1323,14 @@ void ArithToAffinePass::addValueBoundsConstraints(
   for (BoundType type : {BoundType::LB, BoundType::UB}) {
     AffineMap boundMap;
     ValueDimList mapOperands;
-    if (failed(ValueBoundsConstraintSet::computeBound(
-            boundMap, mapOperands, type, var, stopCondition, options)))
+    LogicalResult computed = failure();
+    if (isa<ValueBoundsOpInterface>(owner))
+      computed = ValueBoundsConstraintSet::computeBound(
+          boundMap, mapOperands, type, var, stopCondition, options);
+    // scf.while induction variables: extract the bounds from the structure
+    // of the loop.
+    if (failed(computed) &&
+        failed(computeWhileInductionBound(value, type, boundMap, mapOperands)))
       continue;
 
     // Convert the dimensions of the map to symbols: both dimensions and
@@ -1385,7 +1621,9 @@ ArithToAffinePass::computeOuterBound(Value inner, BoundType boundType,
   if (!inner.getType().isIntOrIndex())
     return std::nullopt;
   Operation *owner = getOwner(inner);
-  if (!owner || !isa<ValueBoundsOpInterface>(owner))
+  // The manual scf.while fallback below covers induction variables of loops
+  // that do not implement ValueBoundsOpInterface.
+  if (!owner)
     return std::nullopt;
 
   MLIRContext *ctx = inner.getContext();
@@ -1407,9 +1645,15 @@ ArithToAffinePass::computeOuterBound(Value inner, BoundType boundType,
 
   AffineMap boundMap;
   ValueDimList mapOperands;
-  if (failed(ValueBoundsConstraintSet::computeBound(
-          boundMap, mapOperands, boundType,
-          ValueBoundsConstraintSet::Variable(inner), stopCondition, options)))
+  LogicalResult computed = failure();
+  if (isa<ValueBoundsOpInterface>(owner))
+    computed = ValueBoundsConstraintSet::computeBound(
+        boundMap, mapOperands, boundType,
+        ValueBoundsConstraintSet::Variable(inner), stopCondition, options);
+  // scf.while induction variables: extract the bound from the structure of
+  // the loop.
+  if (failed(computed) && failed(computeWhileInductionBound(
+                              inner, boundType, boundMap, mapOperands)))
     return std::nullopt;
 
   // Convert the dimensions of the map to symbols: both dimensions and
