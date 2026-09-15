@@ -461,6 +461,23 @@ def ConvertControlFlowToSPIRVPass : Pass<"convert-cf-to-spirv"> {
 }
 
 //===----------------------------------------------------------------------===//
+// LLVMToArith
+//===----------------------------------------------------------------------===//
+
+def ConvertLLVMToArithPass : Pass<"convert-llvm-to-arith"> {
+  let summary = "Convert basic LLVM dialect integer operations to Arith";
+  let description = [{
+    Convert basic integer operations of the LLVM dialect to the Arith
+    dialect: `llvm.add`, `llvm.sub`, `llvm.mul`, `llvm.sdiv`, `llvm.udiv`
+    and `llvm.icmp` are converted to their `arith` counterparts, preserving
+    overflow and exactness flags. This is useful as a pre-processing step
+    for passes operating on the `arith` dialect, e.g.
+    `convert-arith-to-affine`.
+  }];
+  let dependentDialects = ["arith::ArithDialect"];
+}
+
+//===----------------------------------------------------------------------===//
 // LLVMToControlFlow
 //===----------------------------------------------------------------------===//
 
