@@ -6,6 +6,7 @@
 #include "mlir/Analysis/Presburger/PresburgerSpace.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/IR/ArithAttributes.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -21,6 +22,7 @@
 #include "llvm/ADT/DynamicAPInt.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/raw_ostream.h"
 
 namespace mlir {
 #define GEN_PASS_DEF_CONVERTARITHTOAFFINE
@@ -431,6 +433,9 @@ static bool isPositiveMultiple(ArrayRef<DynamicAPInt> row,
 LogicalResult populateConstraint(AffineExpr expr, unsigned numSymbols,
                                  Type type, IntegerRelation &constraint,
                                  SmallVectorImpl<LocalDef> &localDefs) {
+  if (!type.isInteger())
+    return failure();
+  
   auto maybeSum =
       extractCoefficients(expr, numSymbols, &constraint, &localDefs);
   if (!maybeSum)
@@ -537,6 +542,19 @@ std::optional<int> exactLog2(const DynamicAPInt &x) {
   return v == 1 ? std::optional<int>(e) : std::nullopt;
 }
 
+// Converts `x` to an APInt of `bitWidth` bits. `x` must be representable as
+// a `bitWidth`-bit signed integer. DynamicAPInt does not expose its
+// arbitrary-precision representation, so values that do not fit into an
+// int64_t are converted through their decimal string representation.
+static llvm::APInt toAPInt(const DynamicAPInt &x, unsigned bitWidth) {
+  if (x >= DynamicAPInt(INT64_MIN) && x <= DynamicAPInt(INT64_MAX))
+    return llvm::APInt(bitWidth, static_cast<int64_t>(x), /*isSigned=*/true);
+  std::string str;
+  llvm::raw_string_ostream os(str);
+  os << x;
+  return llvm::APInt(bitWidth, os.str(), /*radix=*/10);
+}
+
 Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc,
                                          const IntegerRelation &rel,
                                          ArrayRef<LocalDef> localDefs,
@@ -623,15 +641,13 @@ Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc,
   const auto emitLinearForm = [&](ArrayRef<DynamicAPInt> coeffs,
                                   const DynamicAPInt &constant, Type intType) {
     unsigned bitWidth = intType.getIntOrFloatBitWidth();
-    Value v = arith::ConstantIntOp::create(
-        builder, loc, intType,
-        llvm::APInt(bitWidth, (int64_t)constant, /*isSigned=*/true));
+    Value v = arith::ConstantIntOp::create(builder, loc, intType,
+                                           toAPInt(constant, bitWidth));
     for (unsigned j = 0; j < coeffs.size(); j++) {
       if (coeffs[j] == 0)
         continue;
-      auto cst = arith::ConstantIntOp::create(
-          builder, loc, intType,
-          llvm::APInt(bitWidth, (int64_t)coeffs[j], /*isSigned=*/true));
+      auto cst = arith::ConstantIntOp::create(builder, loc, intType,
+                                              toAPInt(coeffs[j], bitWidth));
       Value ext;
       if (isa<IndexType>(values[j].getType()))
         ext = arith::IndexCastOp::create(builder, loc, intType, values[j]);
@@ -669,7 +685,8 @@ Value ArithToAffinePass::synthesizeCheck(OpBuilder &builder, Location loc,
       q = arith::ShRSIOp::create(builder, loc, v, shift);
     } else {
       auto den =
-          arith::ConstantIntOp::create(builder, loc, intType, (int64_t)def.den);
+          arith::ConstantIntOp::create(builder, loc, intType,
+                                       toAPInt(def.den, bitWidth));
       auto zero = arith::ConstantIntOp::create(builder, loc, intType, 0);
       auto one = arith::ConstantIntOp::create(builder, loc, intType, 1);
       q = arith::DivSIOp::create(builder, loc, v, den);
@@ -730,6 +747,11 @@ ArithToAffinePass::constructAffineMap(Value value, const DimIndex &dimIndex) {
   // We will not trace upwards from block arguments in `valueToAffine()`.
   Operation *def = value.getDefiningOp();
   if (!def) {
+    // Symbols are raised to index via sign-extending casts, so only integer-
+    // and index-typed values can be lifted (e.g. the raw pointer of a plain
+    // `llvm.load %ptr` cannot).
+    if (!value.getType().isIntOrIndex())
+      return std::nullopt;
     AffineExpr expr = getAffineSymbolExpr(dimIndex.at(value), ctx);
     return AffineResult{expr, universe, universe, {}};
   }
@@ -1139,6 +1161,7 @@ std::optional<WhileInductionInfo> matchWhileInduction(Value value) {
         // Normalize to `pred(next, bound)`.
         switch (pred) {
         case arith::CmpIPredicate::slt:
+        case arith::CmpIPredicate::ne:
           pred = arith::CmpIPredicate::sgt;
           break;
         case arith::CmpIPredicate::sle:
