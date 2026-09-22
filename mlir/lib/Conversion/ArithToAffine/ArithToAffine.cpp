@@ -876,6 +876,31 @@ ArithToAffinePass::constructAffineMap(Value value, const DimIndex &dimIndex) {
     SmallVector<LocalDef> locals;
     // We constraint on the sum only.
     DataLayout layout(cast<ModuleOp>(getOperation()));
+
+    // The base may itself be a GEP (e.g. `gep (gep %p[i])[c]`). The address is
+    // rebuilt from the innermost base (see `findGEPBase`), so the offsets
+    // accumulated along the whole chain must be folded into the expression.
+    if (isa_and_nonnull<LLVM::GEPOp>(gep.getBase().getDefiningOp())) {
+      auto base = constructAffineMap(gep.getBase(), dimIndex);
+      if (!base)
+        return std::nullopt;
+      expr = expr + base->expr;
+      constraint = constraint.intersect(base->constraint);
+      reference = reference.intersect(base->reference);
+      locals = mergeLocalDefs(std::move(locals), base->locals, numSymbols);
+    }
+
+    // Advances `elementType` past the type indexed by the current index.
+    const auto advanceElementType = [&]() -> LogicalResult {
+      if (isa<LLVM::LLVMStructType>(elementType))
+        return failure();
+      elementType =
+          TypeSwitch<Type, Type>(elementType)
+              .Case([](LLVM::LLVMArrayType t) { return t.getElementType(); })
+              .Default([](Type t) { return t; });
+      return success();
+    };
+
     for (auto index : indices) {
       if (auto v = dyn_cast<Value>(index)) {
         auto maybe = constructAffineMap(v, dimIndex);
@@ -887,19 +912,23 @@ ArithToAffinePass::constructAffineMap(Value value, const DimIndex &dimIndex) {
         reference = reference.intersect(maybe->reference);
         locals = mergeLocalDefs(std::move(locals), maybe->locals, numSymbols);
 
-        if (isa<LLVM::LLVMStructType>(elementType))
+        if (failed(advanceElementType()))
           return std::nullopt;
-        elementType =
-            TypeSwitch<Type, Type>(elementType)
-                .Case([](LLVM::LLVMArrayType t) { return t.getElementType(); })
-                .Default([](Type t) { return t; });
         // Create the constraint suhc that the entire sum should not overflow.
         if (failed(populateConstraint(expr, numSymbols, v.getType(), constraint,
                                       locals)))
           return std::nullopt;
         syncLocalDefs(reference, locals);
+      } else if (auto cst = dyn_cast<IntegerAttr>(index)) {
+        // Constant indices must be scaled by the size of the type currently
+        // indexed and added to the accumulated offset.
+        int64_t byteOffset =
+            cst.getInt() *
+            static_cast<int64_t>(layout.getTypeSize(elementType));
+        expr = expr + getAffineConstantExpr(byteOffset, ctx);
+        if (failed(advanceElementType()))
+          return std::nullopt;
       }
-      // TODO: IntegerAttr case
     }
     // GEP always treats its offsets as signed.
     return AffineResult{expr, constraint, reference, std::move(locals)};
